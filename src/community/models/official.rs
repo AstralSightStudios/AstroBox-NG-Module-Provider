@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn split_semicolon<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -54,8 +56,8 @@ pub enum PaidTypeV2 {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct DeviceMapV2 {
-    pub xiaomi: Vec<DeviceV2>,
-    pub vivo: Vec<DeviceV2>,
+    pub xiaomi: HashMap<String, DeviceV2>,
+    pub vivo: HashMap<String, DeviceV2>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -16,3 +16,4 @@ tokio = { version = "1", features = ["fs", "io-util"] }
 futures-util = "0.3.31"
 tauri = { version = "2.8.0", features = [] }
 csv = "1.4.0"
+log = "0.4"
