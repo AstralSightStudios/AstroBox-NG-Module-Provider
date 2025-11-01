@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32,7 +34,7 @@ pub enum SortRuleV2 {
 pub struct ManifestV2 {
     pub item: ManifestItemV2,
     pub links: Vec<ManifestLinkV2>,
-    pub downloads: Vec<ManifestDownloadV2>,
+    pub downloads: HashMap<String, ManifestDownloadV2>,
     pub ext: serde_json::Value,
 }
 
@@ -64,13 +66,10 @@ pub struct ManifestLinkV2 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestDownloadV2 {
-    pub version: String,
-    pub filename: String,
-    pub updatelogs: Vec<ManifestUpdateLogV2>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ManifestUpdateLogV2 {
-    pub version: String,
-    pub content: String,
+    #[serde(rename = "file_name")]
+    pub file_name: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
 }

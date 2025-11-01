@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use std::{
+    cmp,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     cdn::GitHubCdn,
@@ -12,15 +17,22 @@ use crate::{
         },
     },
 };
+use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use rand::seq::SliceRandom;
 use reqwest::Client;
+use tauri::{AppHandle, Manager};
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+};
 
-#[derive(Debug)]
 pub struct OfficialV2Provider {
     client: Client,
     cdn: GitHubCdn,
+    app_handle: AppHandle,
     index: ArcSwap<Vec<IndexV2>>,
     splited_index: ArcSwap<Vec<Vec<IndexV2>>>,
     splited_limit: ArcSwap<usize>,
@@ -30,10 +42,11 @@ pub struct OfficialV2Provider {
 }
 
 impl OfficialV2Provider {
-    pub fn new(cdn: GitHubCdn) -> Self {
+    pub fn new(cdn: GitHubCdn, app_handle: AppHandle) -> Self {
         Self {
             client: crate::net::default_client(),
             cdn,
+            app_handle,
             index: ArcSwap::new(Arc::new(Vec::new())),
             splited_index: ArcSwap::new(Arc::new(Vec::new())),
             splited_limit: ArcSwap::new(Arc::new(0)),
@@ -41,6 +54,15 @@ impl OfficialV2Provider {
             explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
         }
+    }
+
+    fn cache_root(&self) -> anyhow::Result<PathBuf> {
+        let base = self
+            .app_handle
+            .path()
+            .app_cache_dir()
+            .map_err(|err| anyhow!("app cache directory unavailable: {err}"))?;
+        Ok(base.join("community").join("official_v2"))
     }
 
     pub fn device_map(&self) -> Arc<DeviceMapV2> {
@@ -150,6 +172,34 @@ impl CommunityProvider for OfficialV2Provider {
     }
 
     async fn refresh(&self) -> anyhow::Result<()> {
+        self.state.store(Arc::new(ProviderState::Updating));
+
+        // 更新index
+        let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let raw = resp.bytes().await?;
+        let mut list: Vec<IndexV2> = Vec::new();
+        let mut csv_read = csv::Reader::from_reader(raw.as_ref());
+        for it in csv_read.deserialize() {
+            list.push(it?);
+        }
+        self.index.store(Arc::new(list));
+        self.split_index(114514, SortRuleV2::Random);
+
+        // 更新设备map
+        let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let map: DeviceMapV2 = resp.json().await?;
+        self.device_map.store(Arc::new(map));
+
+        // 更新探索页
+        let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let explore: serde_json::Value = resp.json().await?;
+        self.explore.store(Arc::new(explore));
+
+        self.state.store(Arc::new(ProviderState::Ready));
+
         Ok(())
     }
 
@@ -258,7 +308,166 @@ impl CommunityProvider for OfficialV2Provider {
         device: String,
         progress_cb: Option<Box<dyn Fn(ProgressData) + Send>>,
     ) -> anyhow::Result<std::path::PathBuf> {
-        Ok(std::path::PathBuf::new())
+        let index = self.index.load();
+        let index_ref = index.clone();
+        let item = index_ref
+            .iter()
+            .find(|entry| entry.id == item_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Item not found"))?;
+
+        let manifest = self
+            .get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash)
+            .await
+            .with_context(|| format!("failed to fetch manifest for {}", item.name))?;
+
+        let downloads = &manifest.downloads;
+        let download_entry = downloads
+            .get(&device)
+            .or_else(|| downloads.get("default"))
+            .or_else(|| downloads.values().next())
+            .cloned()
+            .ok_or_else(|| anyhow!("no downloadable artifact for device `{device}`"))?;
+
+        let mut file_name = download_entry.file_name.trim().to_string();
+        if file_name.is_empty() {
+            if let Some(url) = &download_entry.url {
+                if let Some(name) = url.split('/').last() {
+                    file_name = name.to_string();
+                }
+            }
+        }
+        if file_name.is_empty() {
+            return Err(anyhow!("download entry missing file name"));
+        }
+
+        let resolved_url = if let Some(url) = &download_entry.url {
+            self.cdn.convert_url(url)
+        } else {
+            format!(
+                "{}/{}",
+                self.build_repo_cdn_url_by_index_item(&item),
+                &file_name
+            )
+        };
+
+        let cache_root = self.cache_root()?;
+        let item_dir = cache_root.join(&item.id);
+        fs::create_dir_all(&item_dir)
+            .await
+            .with_context(|| format!("failed to create cache directory {}", item_dir.display()))?;
+
+        let final_path = item_dir.join(&file_name);
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, file_name));
+        let client = self.client.clone();
+        let cleanup_path = tmp_path.clone();
+        let download_result = {
+            let resolved_url = resolved_url;
+            let final_path = final_path;
+            let tmp_path = tmp_path;
+            let progress_cb = progress_cb;
+            async move {
+                let mut file = File::create(&tmp_path).await.with_context(|| {
+                    format!("failed to create temp file {}", tmp_path.display())
+                })?;
+
+                if let Some(cb) = progress_cb.as_ref() {
+                    cb(ProgressData {
+                        progress: 0.0,
+                        status: "downloading".into(),
+                    });
+                }
+
+                let response = client
+                    .get(&resolved_url)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to request {}", resolved_url))?
+                    .error_for_status()
+                    .with_context(|| {
+                        format!("download request returned error for {}", resolved_url)
+                    })?;
+
+                let total = response.content_length();
+                let mut stream = response.bytes_stream();
+                let mut downloaded: u64 = 0;
+                let mut last_emit = Instant::now();
+                let step_bytes = total.map(|t| cmp::max(1, t / 100));
+                let mut last_reported = 0u64;
+
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.with_context(|| "failed to read download chunk")?;
+                    downloaded += chunk.len() as u64;
+                    file.write_all(chunk.as_ref())
+                        .await
+                        .with_context(|| "failed to write download chunk")?;
+
+                    if let Some(cb) = progress_cb.as_ref() {
+                        let mut emit = last_emit.elapsed() >= Duration::from_millis(200);
+                        if !emit {
+                            if let Some(step) = step_bytes {
+                                if downloaded >= last_reported.saturating_add(step)
+                                    || total.map(|t| downloaded >= t).unwrap_or(false)
+                                {
+                                    emit = true;
+                                }
+                            }
+                        }
+
+                        if emit {
+                            let progress = match total {
+                                Some(total_len) if total_len > 0 => {
+                                    (downloaded as f32 / total_len as f32).clamp(0.0, 1.0)
+                                }
+                                _ => 0.0,
+                            };
+                            cb(ProgressData {
+                                progress,
+                                status: "downloading".into(),
+                            });
+                            last_emit = Instant::now();
+                            if step_bytes.is_some() {
+                                last_reported = downloaded;
+                            }
+                        }
+                    }
+                }
+
+                file.flush()
+                    .await
+                    .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+
+                drop(file);
+
+                fs::rename(&tmp_path, &final_path).await.with_context(|| {
+                    format!(
+                        "failed to move downloaded file {} -> {}",
+                        tmp_path.display(),
+                        final_path.display()
+                    )
+                })?;
+
+                if let Some(cb) = progress_cb.as_ref() {
+                    cb(ProgressData {
+                        progress: 1.0,
+                        status: "finished".into(),
+                    });
+                }
+
+                Ok::<_, anyhow::Error>(final_path.clone())
+            }
+        }
+        .await;
+
+        if download_result.is_err() {
+            let _ = fs::remove_file(&cleanup_path).await;
+        }
+
+        download_result
     }
     async fn get_total_items(&self) -> anyhow::Result<u64> {
         Ok(self.index.load().len() as u64)
