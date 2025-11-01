@@ -31,7 +31,7 @@ use tokio::{
 
 pub struct OfficialV2Provider {
     client: Client,
-    cdn: GitHubCdn,
+    cdn: ArcSwap<GitHubCdn>,
     app_handle: AppHandle,
     index: ArcSwap<Vec<IndexV2>>,
     splited_index: ArcSwap<Vec<Vec<IndexV2>>>,
@@ -45,7 +45,7 @@ impl OfficialV2Provider {
     pub fn new(cdn: GitHubCdn, app_handle: AppHandle) -> Self {
         Self {
             client: crate::net::default_client(),
-            cdn,
+            cdn: ArcSwap::new(Arc::new(cdn)),
             app_handle,
             index: ArcSwap::new(Arc::new(Vec::new())),
             splited_index: ArcSwap::new(Arc::new(Vec::new())),
@@ -54,6 +54,10 @@ impl OfficialV2Provider {
             explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
         }
+    }
+
+    pub fn set_cdn(&self, cdn: GitHubCdn) {
+        self.cdn.store(Arc::new(cdn));
     }
 
     fn cache_root(&self) -> anyhow::Result<PathBuf> {
@@ -129,8 +133,8 @@ impl OfficialV2Provider {
     }
 
     pub fn build_repo_cdn_url(&self, owner: &str, name: &str, commit_hash: &str) -> String {
-        self.cdn
-            .convert_url(&self.build_repo_raw_url(owner, name, commit_hash))
+        let cdn = *self.cdn.load_full();
+        cdn.convert_url(&self.build_repo_raw_url(owner, name, commit_hash))
     }
 
     pub fn build_repo_cdn_url_by_index_item(&self, item: &IndexV2) -> String {
@@ -173,9 +177,8 @@ impl CommunityProvider for OfficialV2Provider {
 
     async fn refresh(&self) -> anyhow::Result<()> {
         self.state.store(Arc::new(ProviderState::Updating));
-
         // 更新index
-        let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
+        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let raw = resp.bytes().await?;
         let mut list: Vec<IndexV2> = Vec::new();
@@ -187,13 +190,13 @@ impl CommunityProvider for OfficialV2Provider {
         self.split_index(114514, SortRuleV2::Random);
 
         // 更新设备map
-        let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
+        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let map: DeviceMapV2 = resp.json().await?;
         self.device_map.store(Arc::new(map));
 
         // 更新探索页
-        let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
+        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let explore: serde_json::Value = resp.json().await?;
         self.explore.store(Arc::new(explore));
@@ -342,7 +345,7 @@ impl CommunityProvider for OfficialV2Provider {
         }
 
         let resolved_url = if let Some(url) = &download_entry.url {
-            self.cdn.convert_url(url)
+            (*self.cdn.load_full()).convert_url(url)
         } else {
             format!(
                 "{}/{}",
