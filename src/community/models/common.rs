@@ -23,20 +23,20 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortRuleV2 {
-    Default,
+    Random,
     Name,
     Time,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ManifestV2 {
-    item: ManifestItemV2,
-    links: Vec<ManifestLinkV2>,
-    downloads: Vec<ManifestDownloadV2>,
-    ext: serde_json::Value,
+    pub item: ManifestItemV2,
+    pub links: Vec<ManifestLinkV2>,
+    pub downloads: Vec<ManifestDownloadV2>,
+    pub ext: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ManifestItemV2 {
     pub id: String,
     pub name: String,

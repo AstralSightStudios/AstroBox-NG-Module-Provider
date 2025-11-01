@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex, OnceLock};
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod models;
 pub mod officialv2;
@@ -18,9 +18,7 @@ pub async fn remove_community_provider(name: &str) {
     locked.retain(|p| p.provider_name() != name);
 }
 
-pub async fn get_community_provider(
-    name: &str,
-) -> Option<Arc<dyn CommunityProvider>> {
+pub async fn get_community_provider(name: &str) -> Option<Arc<dyn CommunityProvider>> {
     let providers = COMMUNITY_PROVIDERS.get_or_init(|| Mutex::new(Vec::new()));
     let locked = providers.lock().unwrap();
     for p in locked.iter() {
@@ -63,5 +61,5 @@ pub trait CommunityProvider: Send + Sync {
         device: String,
         progress_cb: Option<Box<dyn Fn(models::common::ProgressData) + Send>>,
     ) -> anyhow::Result<std::path::PathBuf>;
-    async fn get_total_items(&self, search: models::common::SearchConfig) -> anyhow::Result<u64>;
+    async fn get_total_items(&self) -> anyhow::Result<u64>;
 }
