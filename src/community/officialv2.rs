@@ -70,8 +70,20 @@ impl OfficialV2Provider {
     }
 
     pub fn device_map_all(&self) -> Vec<DeviceV2> {
-        let mut all = (*self.device_map()).clone().xiaomi;
-        all.append(&mut (*self.device_map()).clone().vivo);
+        let mut all: Vec<DeviceV2> = (*self.device_map())
+            .clone()
+            .xiaomi
+            .values()
+            .cloned()
+            .collect();
+        all.append(
+            &mut (*self.device_map())
+                .clone()
+                .vivo
+                .values()
+                .cloned()
+                .collect(),
+        );
 
         all
     }
@@ -186,12 +198,14 @@ impl CommunityProvider for OfficialV2Provider {
         self.index.store(Arc::new(list));
         self.split_index(114514, SortRuleV2::Random);
 
+        log::info!("m");
         // 更新设备map
         let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let map: DeviceMapV2 = resp.json().await?;
         self.device_map.store(Arc::new(map));
 
+        log::info!("e");
         // 更新探索页
         let url = self.cdn.convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
@@ -263,11 +277,16 @@ impl CommunityProvider for OfficialV2Provider {
         ];
 
         let device_map = self.device_map.load();
-        device_map.xiaomi.iter().for_each(|xmdev| {
-            if !categories.contains(&xmdev.name) {
-                categories.push(xmdev.name.clone());
-            }
-        });
+        device_map
+            .xiaomi
+            .values()
+            .collect::<Vec<_>>()
+            .iter()
+            .for_each(|xmdev| {
+                if !categories.contains(&xmdev.name) {
+                    categories.push(xmdev.name.clone());
+                }
+            });
 
         // TODO: 在支持Vivo设备后也显示vivo设备的分类
 
