@@ -10,6 +10,13 @@ pub enum GitHubCdn {
 }
 
 impl GitHubCdn {
+    pub const ALL: [Self; 5] = [
+        GitHubCdn::Raw,
+        GitHubCdn::AstroBoxProMirror,
+        GitHubCdn::AstroBoxProMirrorWaterFlames,
+        GitHubCdn::GhFast,
+        GitHubCdn::GhProxy,
+    ];
     pub fn convert_url(self, url: &str) -> String {
         if !url.contains("https://raw.githubusercontent.com/") {
             return url.to_owned();
@@ -34,5 +41,11 @@ impl GitHubCdn {
                 url.strip_prefix("https://").unwrap_or(url)
             ),
         }
+    }
+    pub fn get_cdns() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .map(|item| serde_json::to_string(item).unwrap().replace('"', ""))
+            .collect()
     }
 }

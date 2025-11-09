@@ -1,3 +1,4 @@
+use crate::community::models::common::*;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -28,30 +29,6 @@ pub struct IndexV2 {
     #[serde(deserialize_with = "split_semicolon")]
     pub devices: Vec<String>, // 资源支持的设备型号
     pub paid_type: PaidTypeV2,    // 资源付费类型
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub enum ResourceTypeV2 {
-    #[serde(rename = "quickapp")]
-    QuickApp, // 快应用
-    #[serde(rename = "watchface")]
-    WatchFace, // 表盘
-    #[serde(rename = "firmware")]
-    Firmware, // 固件
-    #[serde(rename = "fontpack")]
-    FontPack, // 字体包
-    #[serde(rename = "iconpack")]
-    IconPack, // 图标包
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub enum PaidTypeV2 {
-    #[serde(rename = "")]
-    Free, // 免费
-    #[serde(rename = "paid")]
-    Paid, // 付费（内含付费内容）
-    #[serde(rename = "force_paid")]
-    ForcePaid, // 强制付费（不给钱不让用）
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]

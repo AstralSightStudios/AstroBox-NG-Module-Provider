@@ -41,10 +41,12 @@ pub struct ManifestV2 {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ManifestItemV2 {
     pub id: String,
+    pub restype: ResourceTypeV2,
     pub name: String,
     pub description: String,
     pub preview: Vec<String>,
     pub icon: String,
+    pub cover: String,
     pub author: Vec<ManifestAuthorV2>,
 }
 
@@ -72,4 +74,28 @@ pub struct ManifestDownloadV2 {
     pub url: Option<String>,
     #[serde(default)]
     pub sha256: Option<String>,
+}
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub enum ResourceTypeV2 {
+    #[default]
+    #[serde(rename = "quickapp")]
+    QuickApp, // 快应用
+    #[serde(rename = "watchface")]
+    WatchFace, // 表盘
+    #[serde(rename = "firmware")]
+    Firmware, // 固件
+    #[serde(rename = "fontpack")]
+    FontPack, // 字体包
+    #[serde(rename = "iconpack")]
+    IconPack, // 图标包
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum PaidTypeV2 {
+    #[serde(rename = "")]
+    Free, // 免费
+    #[serde(rename = "paid")]
+    Paid, // 付费（内含付费内容）
+    #[serde(rename = "force_paid")]
+    ForcePaid, // 强制付费（不给钱不让用）
 }

@@ -38,9 +38,7 @@ pub async fn list_community_providers() -> Vec<String> {
 #[async_trait]
 pub trait CommunityProvider: Send + Sync {
     fn provider_name(&self) -> String;
-    fn as_any(&self) -> &dyn std::any::Any;
-
-    async fn refresh(&self) -> anyhow::Result<()>;
+    async fn refresh(&self, cfg: &str) -> anyhow::Result<()>;
 
     fn state(&self) -> models::common::ProviderState;
 
@@ -49,7 +47,7 @@ pub trait CommunityProvider: Send + Sync {
         page: u32,
         limit: u32,
         search: models::common::SearchConfig,
-    ) -> anyhow::Result<Vec<models::common::ManifestV2>>;
+    ) -> anyhow::Result<Vec<models::common::ManifestItemV2>>;
     async fn get_categories(&self) -> anyhow::Result<Vec<String>>;
     async fn get_item_manifest(
         &self,

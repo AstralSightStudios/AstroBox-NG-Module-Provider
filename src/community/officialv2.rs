@@ -1,5 +1,6 @@
 use std::{
     cmp,
+    collections::HashMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -179,16 +180,20 @@ impl CommunityProvider for OfficialV2Provider {
     fn provider_name(&self) -> String {
         "OfficialV2".to_string()
     }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn state(&self) -> ProviderState {
         let state = self.state.load().clone();
         (*state).clone()
     }
 
-    async fn refresh(&self) -> anyhow::Result<()> {
+    async fn refresh(&self, cfg: &str) -> anyhow::Result<()> {
         self.state.store(Arc::new(ProviderState::Updating));
+
+        //更新cdn
+
+        let cfg: HashMap<String, _> = serde_json::from_str(cfg).unwrap_or(HashMap::new());
+        let cdn: GitHubCdn = *cfg.get("cdn").unwrap_or(&GitHubCdn::Raw);
+        self.cdn.store(Arc::new(cdn));
+
         // 更新index
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
@@ -225,9 +230,13 @@ impl CommunityProvider for OfficialV2Provider {
         page: u32,
         limit: u32,
         search: SearchConfig,
-    ) -> anyhow::Result<Vec<ManifestV2>> {
-        if !(*(self.splited_limit.load().clone())).clone() != limit as usize {
+    ) -> anyhow::Result<Vec<ManifestItemV2>> {
+        if !(*(self.splited_limit.load().clone())) != limit as usize {
             self.split_index(limit as usize, search.sort.clone());
+        }
+
+        if self.splited_index.load().len() <= page as usize {
+            return Ok(Vec::new());
         }
 
         let splited_index = self.splited_index.load().clone();
@@ -249,21 +258,26 @@ impl CommunityProvider for OfficialV2Provider {
 
         let mut ret = Vec::new();
         for item in target_page.iter() {
-            ret.push(ManifestV2 {
-                item: ManifestItemV2 {
-                    id: item.id.clone(),
-                    preview: vec![format!(
-                        "{}/{}",
-                        self.build_repo_cdn_url_by_index_item(&item),
-                        item.cover.clone()
-                    )],
-                    icon: format!(
-                        "{}/{}",
-                        self.build_repo_cdn_url_by_index_item(&item),
-                        item.icon.clone()
-                    ),
-                    ..Default::default()
-                },
+            ret.push(ManifestItemV2 {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                preview: vec![format!(
+                    "{}/{}",
+                    self.build_repo_cdn_url_by_index_item(&item),
+                    item.cover.clone()
+                )],
+                icon: format!(
+                    "{}/{}",
+                    self.build_repo_cdn_url_by_index_item(&item),
+                    item.icon.clone()
+                ),
+                cover: format!(
+                    "{}/{}",
+                    self.build_repo_cdn_url_by_index_item(&item),
+                    item.cover.clone()
+                ),
+                restype: item.restype.clone(),
+
                 ..Default::default()
             });
         }
