@@ -78,7 +78,7 @@ pub struct ManifestDownloadV2 {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub enum ResourceTypeV2 {
     #[default]
-    #[serde(rename = "quickapp")]
+    #[serde(rename = "quick_app")]
     QuickApp, // 快应用
     #[serde(rename = "watchface")]
     WatchFace, // 表盘
