@@ -206,14 +206,12 @@ impl CommunityProvider for OfficialV2Provider {
         self.index.store(Arc::new(list));
         self.split_index(114514, SortRuleV2::Random);
 
-        log::info!("m");
         // 更新设备map
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let map: DeviceMapV2 = resp.json().await?;
         self.device_map.store(Arc::new(map));
 
-        log::info!("e");
         // 更新探索页
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
         let resp = self.client.get(&url).send().await?.error_for_status()?;
