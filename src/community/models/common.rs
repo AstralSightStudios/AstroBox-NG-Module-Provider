@@ -68,13 +68,22 @@ pub struct ManifestLinkV2 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestDownloadV2 {
-    #[serde(rename = "file_name")]
+    pub version: String,
     pub file_name: String,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub updatelogs: Option<Vec<ManifestDownloadUpdateLogV2>>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManifestDownloadUpdateLogV2 {
+    pub version: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub enum ResourceTypeV2 {
     #[default]
