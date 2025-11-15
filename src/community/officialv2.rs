@@ -115,6 +115,17 @@ impl OfficialV2Provider {
         None
     }
 
+    pub fn device_map_model_to_id(&self, model: &str) -> Option<String> {
+        let device_map = self.device_map.load();
+        if let Some(device) = device_map.xiaomi.get(model) {
+            return Some(device.id.clone());
+        }
+        if let Some(device) = device_map.vivo.get(model) {
+            return Some(device.id.clone());
+        }
+        None
+    }
+
     fn split_index(&self, limit: usize, sort: SortRuleV2) {
         let index = self.index.load().clone();
         let mut rng = rand::rng();
