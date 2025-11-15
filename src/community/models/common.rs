@@ -61,7 +61,7 @@ pub struct ManifestAuthorV2 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestLinkV2 {
     #[serde(default)]
-    pub icon: String,
+    pub icon: Option<String>,
     pub title: String,
     pub url: String,
 }
