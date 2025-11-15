@@ -115,6 +115,17 @@ impl OfficialV2Provider {
         None
     }
 
+    pub fn device_map_model_to_id(&self, model: &str) -> Option<String> {
+        let device_map = self.device_map.load();
+        if let Some(device) = device_map.xiaomi.get(model) {
+            return Some(device.id.clone());
+        }
+        if let Some(device) = device_map.vivo.get(model) {
+            return Some(device.id.clone());
+        }
+        None
+    }
+
     fn split_index(&self, limit: usize, sort: SortRuleV2) {
         let index = self.index.load().clone();
         let mut rng = rand::rng();
@@ -312,9 +323,14 @@ impl CommunityProvider for OfficialV2Provider {
         let target_item = index.iter().find(|item| item.id == item_id);
 
         if let Some(item) = target_item {
-            let manifest = self
+            let mut manifest = self
                 .get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash)
                 .await?;
+
+            for (device_id, download) in manifest.downloads.iter_mut() {
+                download.display_name = self.device_map_id_to_name(device_id);
+            }
+
             Ok(ManifestV2 {
                 item: ManifestItemV2 {
                     icon: format!(
