@@ -312,9 +312,14 @@ impl CommunityProvider for OfficialV2Provider {
         let target_item = index.iter().find(|item| item.id == item_id);
 
         if let Some(item) = target_item {
-            let manifest = self
+            let mut manifest = self
                 .get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash)
                 .await?;
+
+            for (device_id, download) in manifest.downloads.iter_mut() {
+                download.display_name = self.device_map_id_to_name(device_id);
+            }
+
             Ok(ManifestV2 {
                 item: ManifestItemV2 {
                     icon: format!(

@@ -75,6 +75,8 @@ pub struct ManifestDownloadV2 {
     #[serde(default)]
     pub sha256: Option<String>,
     #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
     pub updatelogs: Option<Vec<ManifestDownloadUpdateLogV2>>,
 }
 
