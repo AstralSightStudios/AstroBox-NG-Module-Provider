@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub mod legacyparse;
 pub mod models;
 pub mod officialv2;
 

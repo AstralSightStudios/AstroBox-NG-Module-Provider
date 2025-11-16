@@ -175,14 +175,38 @@ impl OfficialV2Provider {
         name: &str,
         commit_hash: &str,
     ) -> anyhow::Result<ManifestV2> {
-        let url = format!(
-            "{}/manifest_v2.json",
-            self.build_repo_cdn_url(owner, name, commit_hash)
-        );
-        let response = self.client.get(&url).send().await?;
-        let text = response.text().await?;
-        let manifest: ManifestV2 = serde_json::from_str(&text)?;
-        Ok(manifest)
+        let base = self.build_repo_cdn_url(owner, name, commit_hash);
+
+        let url_v2 = format!("{}/manifest_v2.json", base);
+        let resp_v2 = self.client.get(&url_v2).send().await?;
+
+        if resp_v2.status() == reqwest::StatusCode::NOT_FOUND {
+            // fallback v1 manifest
+            let url_v1 = format!("{}/manifest.json", base);
+            let resp_v1 = self
+                .client
+                .get(&url_v1)
+                .send()
+                .await?
+                .error_for_status()
+                .with_context(|| format!("failed to request legacy manifest `{url_v1}`"))?;
+
+            let text_v1 = resp_v1.text().await?;
+            let raw_v1: serde_json::Value = serde_json::from_str(&text_v1)
+                .with_context(|| "failed to parse legacy manifest json")?;
+
+            let manifest_v2 = super::legacyparse::manifest_v1_to_v2(raw_v1)
+                .with_context(|| "failed to convert legacy manifest v1 -> v2")?;
+
+            Ok(manifest_v2)
+        } else {
+            let resp_v2 = resp_v2
+                .error_for_status()
+                .with_context(|| format!("failed to request manifest v2 `{url_v2}`"))?;
+            let text_v2 = resp_v2.text().await?;
+            let manifest: ManifestV2 = serde_json::from_str(&text_v2)?;
+            Ok(manifest)
+        }
     }
 }
 
