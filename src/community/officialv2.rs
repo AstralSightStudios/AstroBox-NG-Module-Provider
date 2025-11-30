@@ -384,11 +384,15 @@ impl CommunityProvider for OfficialV2Provider {
     ) -> anyhow::Result<std::path::PathBuf> {
         let index = self.index.load();
         let index_ref = index.clone();
+
+        // 优先根据id查找，找不到再跟名称
+        // 这是为了兼容v1的manifest无id
         let item = index_ref
             .iter()
             .find(|entry| entry.id == item_id)
+            .or_else(|| index_ref.iter().find(|entry| entry.name == item_id))
             .cloned()
-            .ok_or_else(|| anyhow!("Item not found"))?;
+            .ok_or_else(|| anyhow!("Item not found by id or name"))?;
 
         let manifest = self
             .get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash)
@@ -415,6 +419,8 @@ impl CommunityProvider for OfficialV2Provider {
             return Err(anyhow!("download entry missing file name"));
         }
 
+        let safe_file_name = sanitize_local_filename(&file_name);
+
         let resolved_url = if let Some(url) = &download_entry.url {
             (*self.cdn.load_full()).convert_url(url)
         } else {
@@ -431,12 +437,12 @@ impl CommunityProvider for OfficialV2Provider {
             .await
             .with_context(|| format!("failed to create cache directory {}", item_dir.display()))?;
 
-        let final_path = item_dir.join(&file_name);
+        let final_path = item_dir.join(&safe_file_name);
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, file_name));
+        let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, safe_file_name));
         let client = self.client.clone();
         let cleanup_path = tmp_path.clone();
         let download_result = {
@@ -546,4 +552,21 @@ impl CommunityProvider for OfficialV2Provider {
     async fn get_total_items(&self) -> anyhow::Result<u64> {
         Ok(self.index.load().len() as u64)
     }
+}
+
+fn sanitize_local_filename(input: &str) -> String {
+    let forbidden = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+    let mut s: String = input
+        .chars()
+        .map(|c| if forbidden.contains(&c) { '_' } else { c })
+        .collect();
+
+    s = s.trim().to_string();
+
+    if s.is_empty() || s == "." || s == ".." {
+        s = "download".to_string();
+    }
+
+    s
 }
