@@ -169,6 +169,19 @@ impl OfficialV2Provider {
         )
     }
 
+    fn resolve_repo_asset_url(&self, base: &str, path: &str) -> String {
+        if path.starts_with("http://")
+            || path.starts_with("https://")
+            || path.starts_with("data:")
+            || path.starts_with("blob:")
+            || path.starts_with("tauri:")
+            || path.starts_with('/')
+        {
+            return path.to_string();
+        }
+        format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    }
+
     pub async fn get_manifest(
         &self,
         owner: &str,
@@ -355,19 +368,21 @@ impl CommunityProvider for OfficialV2Provider {
                 download.display_name = self.device_map_id_to_name(device_id);
             }
 
+            let base = self.build_repo_cdn_url_by_index_item(item);
+            let cover = self.resolve_repo_asset_url(&base, &manifest.item.cover);
+            let preview = manifest
+                .item
+                .preview
+                .iter()
+                .map(|p| self.resolve_repo_asset_url(&base, p))
+                .collect::<Vec<_>>();
+            let icon = self.resolve_repo_asset_url(&base, &item.icon);
+
             Ok(ManifestV2 {
                 item: ManifestItemV2 {
-                    icon: format!(
-                        "{}/{}",
-                        self.build_repo_cdn_url_by_index_item(&item),
-                        item.icon
-                    ),
-                    preview: manifest
-                        .item
-                        .preview
-                        .iter()
-                        .map(|p| format!("{}/{}", self.build_repo_cdn_url_by_index_item(&item), p))
-                        .collect::<Vec<_>>(),
+                    icon,
+                    preview,
+                    cover,
                     ..manifest.item
                 },
                 ..manifest
