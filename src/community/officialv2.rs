@@ -473,7 +473,7 @@ impl CommunityProvider for OfficialV2Provider {
                 if let Some(cb) = progress_cb.as_ref() {
                     cb(ProgressData {
                         progress: 0.0,
-                        status: "downloading".into(),
+                        status: "".into(),
                     });
                 }
 
@@ -522,7 +522,7 @@ impl CommunityProvider for OfficialV2Provider {
                             };
                             cb(ProgressData {
                                 progress,
-                                status: "downloading".into(),
+                                status: "".into(),
                             });
                             last_emit = Instant::now();
                             if step_bytes.is_some() {
