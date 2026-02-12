@@ -40,6 +40,7 @@ pub struct OfficialV2Provider {
     device_map: ArcSwap<DeviceMapV2>,
     explore: ArcSwap<serde_json::Value>,
     state: ArcSwap<ProviderState>,
+    placeholderIndex: ArcSwap<u32>,
 }
 
 impl OfficialV2Provider {
@@ -54,6 +55,8 @@ impl OfficialV2Provider {
             device_map: ArcSwap::new(Arc::new(DeviceMapV2::default())),
             explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
+            placeholderIndex: ArcSwap::new(Arc::new(0)),
+
         }
     }
 
@@ -248,8 +251,17 @@ impl CommunityProvider for OfficialV2Provider {
         let raw = resp.bytes().await?;
         let mut list: Vec<IndexV2> = Vec::new();
         let mut csv_read = csv::Reader::from_reader(raw.as_ref());
-        for it in csv_read.deserialize() {
-            list.push(it?);
+        for it in csv_read.deserialize::<IndexV2>() {
+            if let Ok(mut i) = it {
+                if &i.id == "<placeholder>" {
+                    let n = self.placeholderIndex.load_full().clone();
+                    self.placeholderIndex.store(Arc::new(*n + 1));
+                    i.id = format!("placeholder_{}", n);
+                    list.push(i);
+                }else{
+                    list.push(i);
+                }
+            }
         }
         self.index.store(Arc::new(list));
         self.split_index(114514, SortRuleV2::Random);
