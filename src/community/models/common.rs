@@ -86,7 +86,7 @@ pub struct ManifestDownloadUpdateLogV2 {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub enum ResourceTypeV2 {
     #[default]
     #[serde(rename = "quick_app")]
@@ -101,7 +101,7 @@ pub enum ResourceTypeV2 {
     IconPack, // 图标包
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub enum PaidTypeV2 {
     #[serde(rename = "")]
     Free, // 免费

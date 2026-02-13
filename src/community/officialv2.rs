@@ -12,7 +12,7 @@ use crate::{
         CommunityProvider,
         models::{
             common::{
-                ManifestItemV2, ManifestV2, ProgressData, ProviderState, SearchConfig, SortRuleV2,
+                ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData, ProviderState, ResourceTypeV2, SearchConfig, SortRuleV2
             },
             official::{DeviceMapV2, DeviceV2, IndexV2},
         },
@@ -30,6 +30,13 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
+
+
+const HIDE_PAID:&str="hide_paid";      // 隐藏付费
+const HIDE_FORCE_PAID:&str="hide_force_paid";// 隐藏强制付费
+const QUICK_APP:&str="quick_app";         // 快应用
+const WATCHFACE:&str="watchface";        // 表盘
+
 pub struct OfficialV2Provider {
     client: Client,
     cdn: ArcSwap<GitHubCdn>,
@@ -40,7 +47,7 @@ pub struct OfficialV2Provider {
     device_map: ArcSwap<DeviceMapV2>,
     explore: ArcSwap<serde_json::Value>,
     state: ArcSwap<ProviderState>,
-    placeholderIndex: ArcSwap<u32>,
+    placeholder_index: ArcSwap<u32>,
 }
 
 impl OfficialV2Provider {
@@ -55,7 +62,7 @@ impl OfficialV2Provider {
             device_map: ArcSwap::new(Arc::new(DeviceMapV2::default())),
             explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
-            placeholderIndex: ArcSwap::new(Arc::new(0)),
+            placeholder_index: ArcSwap::new(Arc::new(0)),
 
         }
     }
@@ -254,8 +261,8 @@ impl CommunityProvider for OfficialV2Provider {
         for it in csv_read.deserialize::<IndexV2>() {
             if let Ok(mut i) = it {
                 if &i.id == "<placeholder>" {
-                    let n = self.placeholderIndex.load_full().clone();
-                    self.placeholderIndex.store(Arc::new(*n + 1));
+                    let n = self.placeholder_index.load_full().clone();
+                    self.placeholder_index.store(Arc::new(*n + 1));
                     i.id = format!("placeholder_{}", n);
                     list.push(i);
                 }else{
@@ -289,30 +296,73 @@ impl CommunityProvider for OfficialV2Provider {
         limit: u32,
         search: SearchConfig,
     ) -> anyhow::Result<Vec<ManifestItemV2>> {
-        if !(*(self.splited_limit.load().clone())) != limit as usize {
-            self.split_index(limit as usize, search.sort.clone());
-        }
+        let index = self.index.load().clone();
+        let mut filtered_index = (*index).clone();
 
-        if self.splited_index.load().len() <= page as usize {
-            return Ok(Vec::new());
-        }
+        // 先根据搜索条件过滤整个索引
+        if let Some(categories) = &search.category {
+            let hide_paid = categories.contains(&HIDE_PAID.to_string());
+            let hide_force_paid = categories.contains(&HIDE_FORCE_PAID.to_string());
+            let quick_app = categories.contains(&QUICK_APP.to_string());
+            let watchface = categories.contains(&WATCHFACE.to_string());
+            let mut devices = Vec::new();
 
-        let splited_index = self.splited_index.load().clone();
-        let mut target_page = splited_index[page as usize].clone();
+            self.device_map().xiaomi.values().filter(|e|{
+                categories.contains(&e.name)
+            }).for_each(|e|{
+                devices.push(e.id.clone());
+            });
 
-        if let Some(categories) = search.category {
-            target_page.retain(|item| {
-                item.devices
+            let res_type = if quick_app&&watchface {
+                None
+            }else if quick_app{
+                Some(ResourceTypeV2::QuickApp)
+            }else if watchface{
+                Some(ResourceTypeV2::WatchFace)
+            }else{
+                None
+            };
+
+            filtered_index.retain(|item| {
+                (item.devices
                     .iter()
-                    .any(|category| categories.contains(category))
+                    .any(|category| devices.contains(category))||devices.is_empty())
+                && !(item.paid_type == PaidTypeV2::ForcePaid && hide_force_paid)
+                && !(item.paid_type == PaidTypeV2::Paid && hide_paid)
+                && (if let Some(t) = &res_type {
+                    &item.restype == t
+                } else {
+                    true
+                })
             });
         }
 
         if let Some(keyword) = &search.filter {
-            target_page.retain(|item| {
+            filtered_index.retain(|item| {
                 item.name.contains(keyword) || item.tags.iter().any(|tag| tag.contains(keyword))
             });
         }
+
+        // 对过滤后的结果进行排序
+        let mut rng = rand::rng();
+        match &search.sort {
+            SortRuleV2::Random => filtered_index.shuffle(&mut rng),
+            SortRuleV2::Name => {
+                filtered_index.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            SortRuleV2::Time => {
+                filtered_index.reverse();
+            }
+        };
+
+        // 对过滤并排序后的结果分页
+        let start = (page as usize) * (limit as usize);
+        if start >= filtered_index.len() {
+            return Ok(Vec::new());
+        }
+
+        let end = std::cmp::min(start + limit as usize, filtered_index.len());
+        let target_page = &filtered_index[start..end];
 
         let mut ret = Vec::new();
         for item in target_page.iter() {
@@ -345,10 +395,10 @@ impl CommunityProvider for OfficialV2Provider {
 
     async fn get_categories(&self) -> anyhow::Result<Vec<String>> {
         let mut categories = vec![
-            "hidden_paid".to_string(),       // 隐藏付费
-            "hidden_force_paid".to_string(), // 隐藏强制付费
-            "quickapp".to_string(),          // 快应用
-            "watchface".to_string(),         // 表盘
+            HIDE_PAID.to_string(),
+            HIDE_FORCE_PAID.to_string(),
+            QUICK_APP.to_string(),
+            WATCHFACE.to_string()
         ];
 
         let device_map = self.device_map.load();
