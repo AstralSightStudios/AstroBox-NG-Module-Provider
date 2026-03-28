@@ -23,7 +23,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use rand::seq::SliceRandom;
-use reqwest::Client;
 use tauri::{AppHandle, Manager};
 use tokio::{
     fs::{self, File},
@@ -38,7 +37,6 @@ const QUICK_APP:&str="quick_app";         // 快应用
 const WATCHFACE:&str="watchface";        // 表盘
 
 pub struct OfficialV2Provider {
-    client: Client,
     cdn: ArcSwap<GitHubCdn>,
     app_handle: AppHandle,
     index: ArcSwap<Vec<IndexV2>>,
@@ -53,7 +51,6 @@ pub struct OfficialV2Provider {
 impl OfficialV2Provider {
     pub fn new(cdn: GitHubCdn, app_handle: AppHandle) -> Self {
         Self {
-            client: crate::net::default_client(),
             cdn: ArcSwap::new(Arc::new(cdn)),
             app_handle,
             index: ArcSwap::new(Arc::new(Vec::new())),
@@ -199,15 +196,15 @@ impl OfficialV2Provider {
         commit_hash: &str,
     ) -> anyhow::Result<ManifestV2> {
         let base = self.build_repo_cdn_url(owner, name, commit_hash);
+        let client = crate::net::default_client();
 
         let url_v2 = format!("{}/manifest_v2.json", base);
-        let resp_v2 = self.client.get(&url_v2).send().await?;
+        let resp_v2 = client.get(&url_v2).send().await?;
 
         if resp_v2.status() == reqwest::StatusCode::NOT_FOUND {
             // fallback v1 manifest
             let url_v1 = format!("{}/manifest.json", base);
-            let resp_v1 = self
-                .client
+            let resp_v1 = client
                 .get(&url_v1)
                 .send()
                 .await?
@@ -251,10 +248,11 @@ impl CommunityProvider for OfficialV2Provider {
         let cfg: HashMap<String, _> = serde_json::from_str(cfg).unwrap_or(HashMap::new());
         let cdn: GitHubCdn = *cfg.get("cdn").unwrap_or(&GitHubCdn::Raw);
         self.cdn.store(Arc::new(cdn));
+        let client = crate::net::default_client();
 
         // 更新index
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
-        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let resp = client.get(&url).send().await?.error_for_status()?;
         let raw = resp.bytes().await?;
         let mut list: Vec<IndexV2> = Vec::new();
         let mut csv_read = csv::Reader::from_reader(raw.as_ref());
@@ -275,13 +273,13 @@ impl CommunityProvider for OfficialV2Provider {
 
         // 更新设备map
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
-        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let resp = client.get(&url).send().await?.error_for_status()?;
         let map: DeviceMapV2 = resp.json().await?;
         self.device_map.store(Arc::new(map));
 
         // 更新探索页
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
-        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let resp = client.get(&url).send().await?.error_for_status()?;
         let explore: serde_json::Value = resp.json().await?;
         self.explore.store(Arc::new(explore));
 
@@ -520,7 +518,7 @@ impl CommunityProvider for OfficialV2Provider {
             .unwrap_or_default()
             .as_nanos();
         let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, safe_file_name));
-        let client = self.client.clone();
+        let client = crate::net::default_client();
         let cleanup_path = tmp_path.clone();
         let download_result = {
             let resolved_url = resolved_url;
