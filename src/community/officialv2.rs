@@ -12,7 +12,8 @@ use crate::{
         CommunityProvider,
         models::{
             common::{
-                ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData, ProviderState, ResourceTypeV2, SearchConfig, SortRuleV2
+                ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData, ProviderState,
+                ResourceTypeV2, SearchConfig, SortRuleV2,
             },
             official::{DeviceMapV2, DeviceV2, IndexV2},
         },
@@ -29,12 +30,10 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
-
-
-const HIDE_PAID:&str="hide_paid";      // 隐藏付费
-const HIDE_FORCE_PAID:&str="hide_force_paid";// 隐藏强制付费
-const QUICK_APP:&str="quick_app";         // 快应用
-const WATCHFACE:&str="watchface";        // 表盘
+const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
+const HIDE_FORCE_PAID: &str = "hide_force_paid"; // 隐藏强制付费
+const QUICK_APP: &str = "quick_app"; // 快应用
+const WATCHFACE: &str = "watchface"; // 表盘
 
 pub struct OfficialV2Provider {
     cdn: ArcSwap<GitHubCdn>,
@@ -60,7 +59,6 @@ impl OfficialV2Provider {
             explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             placeholder_index: ArcSwap::new(Arc::new(0)),
-
         }
     }
 
@@ -186,7 +184,11 @@ impl OfficialV2Provider {
         {
             return path.to_string();
         }
-        format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
     }
 
     pub async fn get_manifest(
@@ -263,7 +265,7 @@ impl CommunityProvider for OfficialV2Provider {
                     self.placeholder_index.store(Arc::new(*n + 1));
                     i.id = format!("placeholder_{}", n);
                     list.push(i);
-                }else{
+                } else {
                     list.push(i);
                 }
             }
@@ -305,33 +307,37 @@ impl CommunityProvider for OfficialV2Provider {
             let watchface = categories.contains(&WATCHFACE.to_string());
             let mut devices = Vec::new();
 
-            self.device_map().xiaomi.values().filter(|e|{
-                categories.contains(&e.name)
-            }).for_each(|e|{
-                devices.push(e.id.clone());
-            });
+            self.device_map()
+                .xiaomi
+                .values()
+                .filter(|e| categories.contains(&e.name))
+                .for_each(|e| {
+                    devices.push(e.id.clone());
+                });
 
-            let res_type = if quick_app&&watchface {
+            let res_type = if quick_app && watchface {
                 None
-            }else if quick_app{
+            } else if quick_app {
                 Some(ResourceTypeV2::QuickApp)
-            }else if watchface{
+            } else if watchface {
                 Some(ResourceTypeV2::WatchFace)
-            }else{
+            } else {
                 None
             };
 
             filtered_index.retain(|item| {
-                (item.devices
+                (item
+                    .devices
                     .iter()
-                    .any(|category| devices.contains(category))||devices.is_empty())
-                && !(item.paid_type == PaidTypeV2::ForcePaid && hide_force_paid)
-                && !(item.paid_type == PaidTypeV2::Paid && hide_paid)
-                && (if let Some(t) = &res_type {
-                    &item.restype == t
-                } else {
-                    true
-                })
+                    .any(|category| devices.contains(category))
+                    || devices.is_empty())
+                    && !(item.paid_type == PaidTypeV2::ForcePaid && hide_force_paid)
+                    && !(item.paid_type == PaidTypeV2::Paid && hide_paid)
+                    && (if let Some(t) = &res_type {
+                        &item.restype == t
+                    } else {
+                        true
+                    })
             });
         }
 
@@ -396,7 +402,7 @@ impl CommunityProvider for OfficialV2Provider {
             HIDE_PAID.to_string(),
             HIDE_FORCE_PAID.to_string(),
             QUICK_APP.to_string(),
-            WATCHFACE.to_string()
+            WATCHFACE.to_string(),
         ];
 
         let device_map = self.device_map.load();
