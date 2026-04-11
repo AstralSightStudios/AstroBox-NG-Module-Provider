@@ -10,13 +10,13 @@ use crate::{
     cdn::GitHubCdn,
     community::{
         CommunityProvider,
-        models::{
-            common::{
-                ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData, ProviderState,
-                ResourceTypeV2, SearchConfig, SortRuleV2,
+            models::{
+                common::{
+                    ManifestDownloadV2, ManifestItemV2, ManifestV2, PaidTypeV2,
+                    ProgressData, ProviderState, ResourceTypeV2, SearchConfig, SortRuleV2,
+                },
+                official::{DeviceMapV2, DeviceV2, IndexV2},
             },
-            official::{DeviceMapV2, DeviceV2, IndexV2},
-        },
     },
 };
 use anyhow::{Context, anyhow};
@@ -229,6 +229,66 @@ impl OfficialV2Provider {
             let manifest: ManifestV2 = serde_json::from_str(&text_v2)?;
             Ok(manifest)
         }
+    }
+
+    pub async fn resolve_download_entry(
+        &self,
+        item_id: String,
+        device: String,
+        trial: bool,
+    ) -> anyhow::Result<ManifestDownloadV2> {
+        let index = self.index.load();
+        let index_ref = index.clone();
+
+        let item = index_ref
+            .iter()
+            .find(|entry| entry.id == item_id)
+            .or_else(|| index_ref.iter().find(|entry| entry.name == item_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("Item not found by id or name"))?;
+
+        let manifest = self
+            .get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash)
+            .await
+            .with_context(|| format!("failed to fetch manifest for {}", item.name))?;
+
+        let entries = if trial {
+            manifest
+                .ext
+                .get("trialDownloads")
+                .cloned()
+                .map(serde_json::from_value::<HashMap<String, ManifestDownloadV2>>)
+                .transpose()
+                .with_context(|| "failed to parse trialDownloads")?
+                .unwrap_or_default()
+        } else {
+            manifest.downloads.clone()
+        };
+
+        let mut entry = entries
+            .get(&device)
+            .or_else(|| entries.get("default"))
+            .or_else(|| entries.values().next())
+            .cloned()
+            .ok_or_else(|| anyhow!("no downloadable artifact for device `{device}`"))?;
+
+        if entry.display_name.is_none() {
+            entry.display_name = self.device_map_id_to_name(&device);
+        }
+
+        let base = self.build_repo_cdn_url_by_index_item(&item);
+        let resolved_url = if let Some(url) = &entry.url {
+            self.resolve_repo_asset_url(&base, url)
+        } else {
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                entry.file_name.trim_start_matches('/')
+            )
+        };
+        entry.url = Some(resolved_url);
+
+        Ok(entry)
     }
 }
 
@@ -457,6 +517,7 @@ impl CommunityProvider for OfficialV2Provider {
             Err(anyhow::anyhow!("Item not found"))
         }
     }
+
     async fn download(
         &self,
         item_id: String,
