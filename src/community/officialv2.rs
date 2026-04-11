@@ -10,13 +10,13 @@ use crate::{
     cdn::GitHubCdn,
     community::{
         CommunityProvider,
-            models::{
-                common::{
-                    ManifestDownloadV2, ManifestItemV2, ManifestV2, PaidTypeV2,
-                    ProgressData, ProviderState, ResourceTypeV2, SearchConfig, SortRuleV2,
-                },
-                official::{DeviceMapV2, DeviceV2, IndexV2},
+        models::{
+            common::{
+                ManifestDownloadV2, ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData,
+                ProviderState, ResourceTypeV2, SearchConfig, SortRuleV2,
             },
+            official::{DeviceMapV2, DeviceV2, IndexV2},
+        },
     },
 };
 use anyhow::{Context, anyhow};
