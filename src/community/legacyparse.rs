@@ -5,6 +5,14 @@ use crate::community::models::common::{
     ManifestLinkV2, ManifestV2,
 };
 
+fn parse_optional_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 fn map_download_key_v1_to_v2(key: &str) -> String {
     // 不需要再维护这个列表了，v1的设备支持到s5和rw6即为终点
     let ret = match key {
@@ -163,6 +171,8 @@ pub fn manifest_v1_to_v2(raw: serde_json::Value) -> anyhow::Result<ManifestV2> {
                 .to_string();
 
             let url = v.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let version_code = parse_optional_u64(v.get("versionCode"))
+                .or_else(|| parse_optional_u64(v.get("version_code")));
             let sha256 = v
                 .get("sha256")
                 .and_then(|v| v.as_str())
@@ -196,6 +206,7 @@ pub fn manifest_v1_to_v2(raw: serde_json::Value) -> anyhow::Result<ManifestV2> {
                 ManifestDownloadV2 {
                     version,
                     file_name,
+                    version_code,
                     url,
                     sha256,
                     display_name,

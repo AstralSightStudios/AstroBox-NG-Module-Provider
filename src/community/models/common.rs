@@ -70,6 +70,8 @@ pub struct ManifestLinkV2 {
 pub struct ManifestDownloadV2 {
     pub version: String,
     pub file_name: String,
+    #[serde(default, rename = "versionCode", alias = "version_code")]
+    pub version_code: Option<u64>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
