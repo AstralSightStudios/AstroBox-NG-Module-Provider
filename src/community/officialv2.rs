@@ -448,6 +448,7 @@ impl CommunityProvider for OfficialV2Provider {
                     self.build_repo_cdn_url_by_index_item(&item),
                     item.cover.clone()
                 ),
+                paid_type: Some(item.paid_type.clone()),
                 restype: item.restype.clone(),
 
                 ..Default::default()
@@ -509,6 +510,7 @@ impl CommunityProvider for OfficialV2Provider {
                     icon,
                     preview,
                     cover,
+                    paid_type: Some(item.paid_type.clone()),
                     ..manifest.item
                 },
                 ..manifest

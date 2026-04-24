@@ -47,6 +47,8 @@ pub struct ManifestItemV2 {
     pub preview: Vec<String>,
     pub icon: String,
     pub cover: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_type: Option<PaidTypeV2>,
     pub author: Vec<ManifestAuthorV2>,
 }
 
