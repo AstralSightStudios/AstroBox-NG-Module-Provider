@@ -242,7 +242,11 @@ impl OfficialV2Provider {
             {
                 format!("{}({})", prefix, link)
             } else {
-                let resolved = format!("{}{}", base_raw, link.trim_start_matches('/'));
+                let resolved = format!(
+                    "{}{}",
+                    base_raw,
+                    link.trim_start_matches('/')
+                );
                 format!("{}({})", prefix, cdn.convert_url(&resolved))
             }
         });
