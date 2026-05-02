@@ -24,6 +24,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use rand::seq::SliceRandom;
+use regex::Regex;
 use tauri::{AppHandle, Manager};
 use tokio::{
     fs::{self, File},
@@ -189,6 +190,68 @@ impl OfficialV2Provider {
             base.trim_end_matches('/'),
             path.trim_start_matches('/')
         )
+    }
+
+    pub async fn get_blog_markdown(&self, path: &str) -> anyhow::Result<String> {
+        let cdn = *self.cdn.load_full();
+        let raw_url = format!(
+            "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/{}",
+            path
+        );
+        let url = cdn.convert_url(&raw_url);
+        let client = crate::net::default_client();
+        let resp = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("failed to fetch blog markdown from {}", url))?;
+        let text = resp.text().await?;
+
+        // Replace naked raw.githubusercontent.com URLs
+        let raw_re = Regex::new(
+            r#"https://raw\.githubusercontent\.com/AstralSightStudios/AstroBox-Repo/[^)\s\"']+"#,
+        )
+        .unwrap();
+        let text = raw_re.replace_all(&text, |caps: &regex::Captures<'_>| {
+            let matched = caps.get(0).unwrap().as_str();
+            cdn.convert_url(matched)
+        });
+
+        // Resolve relative paths in markdown links/images
+        let base_dir = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if base_dir.is_empty() {
+            return Ok(text.into_owned());
+        }
+
+        let rel_re = Regex::new(r"(!?\[[^\]]*\])\(([^)\s]+)\)").unwrap();
+        let base_raw = format!(
+            "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/{}/",
+            base_dir.trim_end_matches('/')
+        );
+        let text = rel_re.replace_all(&text, |caps: &regex::Captures<'_>| {
+            let prefix = caps.get(1).unwrap().as_str();
+            let link = caps.get(2).unwrap().as_str();
+            if link.starts_with("http://")
+                || link.starts_with("https://")
+                || link.starts_with("data:")
+                || link.starts_with('/')
+            {
+                format!("{}({})", prefix, link)
+            } else {
+                let resolved = format!(
+                    "{}{}",
+                    base_raw,
+                    link.trim_start_matches('/')
+                );
+                format!("{}({})", prefix, cdn.convert_url(&resolved))
+            }
+        });
+
+        Ok(text.into_owned())
     }
 
     pub async fn get_manifest(
