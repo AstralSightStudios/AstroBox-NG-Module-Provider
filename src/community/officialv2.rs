@@ -755,6 +755,18 @@ impl CommunityProvider for OfficialV2Provider {
     async fn get_total_items(&self) -> anyhow::Result<u64> {
         Ok(self.index.load().len() as u64)
     }
+
+    async fn probe_download_size(
+        &self,
+        item_id: String,
+        device: String,
+    ) -> anyhow::Result<Option<u64>> {
+        let entry = self.resolve_download_entry(item_id, device, false).await?;
+        let url = entry.url.clone().context("download url missing")?;
+        let client = crate::net::default_client();
+        let resp = client.get(&url).send().await?.error_for_status()?;
+        Ok(resp.content_length())
+    }
 }
 
 fn sanitize_local_filename(input: &str) -> String {

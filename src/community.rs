@@ -61,4 +61,12 @@ pub trait CommunityProvider: Send + Sync {
         progress_cb: Option<Box<dyn Fn(models::common::ProgressData) + Send>>,
     ) -> anyhow::Result<std::path::PathBuf>;
     async fn get_total_items(&self) -> anyhow::Result<u64>;
+
+    async fn probe_download_size(
+        &self,
+        _item_id: String,
+        _device: String,
+    ) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
 }
