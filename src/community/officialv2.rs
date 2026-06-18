@@ -461,8 +461,10 @@ impl CommunityProvider for OfficialV2Provider {
         }
 
         if let Some(keyword) = &search.filter {
+            let keyword_lower = keyword.to_lowercase();
             filtered_index.retain(|item| {
-                item.name.contains(keyword) || item.tags.iter().any(|tag| tag.contains(keyword))
+                item.name.to_lowercase().contains(&keyword_lower)
+                    || item.tags.iter().any(|tag| tag.to_lowercase().contains(&keyword_lower))
             });
         }
 
