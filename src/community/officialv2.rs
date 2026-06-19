@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,12 +19,16 @@ use crate::{
         },
     },
 };
+use account::AccountStore;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use base64::Engine as _;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use rand::seq::SliceRandom;
 use regex::Regex;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tokio::{
     fs::{self, File},
@@ -35,6 +39,120 @@ const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
 const HIDE_FORCE_PAID: &str = "hide_force_paid"; // 隐藏强制付费
 const QUICK_APP: &str = "quick_app"; // 快应用
 const WATCHFACE: &str = "watchface"; // 表盘
+const ACCOUNT_SOURCE_STORAGE_KEY: &str = "network_account_source_cfg";
+const ASTROBOX_ACCOUNT_PROVIDER: &str = "astrobox";
+
+// 选中官方镜像源时，图片经境内 CDN 取回后内联为 base64 data URI（绕开 webview 直连 GitHub）
+const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024; // 单张内联上限，超过则回退原始 URL
+const IMAGE_B64_CACHE_CAP: usize = 1024; // 内存缓存条数上限；内容按 commit 寻址、不可变
+const IMAGE_INLINE_CONCURRENCY: usize = 12; // 单页内联的并发抓取数
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSourceConfig {
+    source: Option<AccountSourceId>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AccountSourceId {
+    CasAstralsight,
+    WaterFlames,
+}
+
+impl Default for AccountSourceId {
+    fn default() -> Self {
+        Self::CasAstralsight
+    }
+}
+
+impl AccountSourceId {
+    fn astrobox_api_base_url(self) -> &'static str {
+        match self {
+            Self::CasAstralsight => "https://astrobox-api.astralsight.space",
+            Self::WaterFlames => "https://asastrobox-api.waterflames.cn",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SourceCdnDownloadRequest {
+    id: String,
+    device: Option<String>,
+    node: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCdnDownloadResponse {
+    url: String,
+    accelerated: bool,
+    #[allow(dead_code)]
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<u64>,
+    #[allow(dead_code)]
+    node: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceCdnImagesItem {
+    id: String,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceCdnImagesRequest {
+    items: Vec<SourceCdnImagesItem>,
+    node: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCdnImageEntry {
+    path: String,
+    url: String,
+    accelerated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCdnImagesResultItem {
+    id: String,
+    images: Vec<SourceCdnImageEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCdnImagesResponse {
+    results: Vec<SourceCdnImagesResultItem>,
+}
+
+// 一次图片内联请求：定位某资源仓内某相对图片
+struct ImageRef {
+    id: String,
+    owner: String,
+    repo: String,
+    commit: String,
+    rel: String, // 规范化的仓内相对路径(无前导 /)
+}
+
+// content-type 缺失时按 URL 扩展名兜底推断图片 MIME
+fn guess_image_mime(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.ends_with(".webp") {
+        "image/webp"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".bmp") {
+        "image/bmp"
+    } else if path.ends_with(".avif") {
+        "image/avif"
+    } else {
+        "image/png"
+    }
+}
 
 pub struct OfficialV2Provider {
     cdn: ArcSwap<GitHubCdn>,
@@ -46,6 +164,8 @@ pub struct OfficialV2Provider {
     explore: ArcSwap<serde_json::Value>,
     state: ArcSwap<ProviderState>,
     placeholder_index: ArcSwap<u32>,
+    // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
+    image_b64_cache: Mutex<HashMap<String, Arc<str>>>,
 }
 
 impl OfficialV2Provider {
@@ -60,6 +180,7 @@ impl OfficialV2Provider {
             explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             placeholder_index: ArcSwap::new(Arc::new(0)),
+            image_b64_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -190,6 +311,257 @@ impl OfficialV2Provider {
             base.trim_end_matches('/'),
             path.trim_start_matches('/')
         )
+    }
+
+    async fn current_account_source(&self) -> AccountSourceId {
+        account::local_storage_get_json::<AccountSourceConfig>(
+            &self.app_handle,
+            ACCOUNT_SOURCE_STORAGE_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.source)
+        .unwrap_or_default()
+    }
+
+    async fn current_astrobox_token(&self) -> anyhow::Result<String> {
+        let account = AccountStore::new(ASTROBOX_ACCOUNT_PROVIDER)
+            .load(&self.app_handle)
+            .await
+            .context("failed to read AstroBox account")?
+            .ok_or_else(|| anyhow!("请先登录 AstroBox 账号"))?;
+        account
+            .token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| anyhow!("请先登录 AstroBox 账号"))
+    }
+
+    async fn resolve_source_cdn_download_url(
+        &self,
+        item_id: &str,
+        device: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let token = self.current_astrobox_token().await?;
+        let base_url = self.current_account_source().await.astrobox_api_base_url();
+        let request = SourceCdnDownloadRequest {
+            id: item_id.to_string(),
+            device: device
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            node: "edgeone",
+        };
+        let response = crate::net::default_client()
+            .post(format!("{base_url}/source-cdn/download"))
+            .header("X-ASTROBOX-TOKEN", token)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to request official CDN download URL")?;
+        let status = response.status();
+
+        if status == StatusCode::FORBIDDEN {
+            return Err(anyhow!("官方加速源需要 AstroBox Pro"));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(anyhow!("今日官方加速源流量已用完"));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(anyhow!("官方加速源未找到此资源"));
+        }
+
+        let response = response
+            .error_for_status()
+            .context("official CDN download URL request failed")?
+            .json::<SourceCdnDownloadResponse>()
+            .await
+            .context("failed to parse official CDN download URL")?;
+        if !response.accelerated {
+            log::info!("[OfficialV2] source CDN fallback to GitHub for {}", item_id);
+        }
+        Ok(response.url)
+    }
+
+    // 与服务端 buildCosKey 一致：official-source/{owner}/{repo}/{commit}/{path}
+    fn image_cos_key(owner: &str, repo: &str, commit: &str, rel: &str) -> String {
+        format!(
+            "official-source/{}/{}/{}/{}",
+            owner,
+            repo,
+            commit,
+            rel.trim_start_matches('/')
+        )
+    }
+
+    // 仅相对(同仓)路径可镜像/内联；绝对/外链/data 等返回 None 由调用方按原样处理
+    fn relative_image_path(path: &str) -> Option<String> {
+        let p = path.trim();
+        if p.is_empty()
+            || p.starts_with("http://")
+            || p.starts_with("https://")
+            || p.starts_with("data:")
+            || p.starts_with("blob:")
+            || p.starts_with("tauri:")
+            || p.starts_with('/')
+        {
+            return None;
+        }
+        Some(p.trim_start_matches('/').to_string())
+    }
+
+    fn image_cache_get(&self, key: &str) -> Option<Arc<str>> {
+        self.image_b64_cache.lock().ok()?.get(key).cloned()
+    }
+
+    fn image_cache_put(&self, key: &str, value: &str) {
+        if let Ok(mut map) = self.image_b64_cache.lock() {
+            // 内容不可变，溢出整清即可（无需 LRU）
+            if map.len() >= IMAGE_B64_CACHE_CAP {
+                map.clear();
+            }
+            map.insert(key.to_string(), Arc::from(value));
+        }
+    }
+
+    // 抓取图片并编码为 data URI。优先用响应 content-type，否则按扩展名推断。
+    async fn fetch_image_data_uri(url: &str) -> anyhow::Result<String> {
+        let resp = crate::net::default_client()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp.bytes().await?;
+        if bytes.len() > MAX_INLINE_IMAGE_BYTES {
+            return Err(anyhow!("image too large to inline: {} bytes", bytes.len()));
+        }
+        let mime = content_type
+            .filter(|c| c.starts_with("image/"))
+            .unwrap_or_else(|| guess_image_mime(url).to_string());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{};base64,{}", mime, b64))
+    }
+
+    // 向服务端批量换取图片签名直链（每翻页一次），按资源 id 分组
+    async fn resolve_source_cdn_image_urls(
+        &self,
+        items: HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<Vec<(String, Vec<SourceCdnImageEntry>)>> {
+        let token = self.current_astrobox_token().await?;
+        let base_url = self.current_account_source().await.astrobox_api_base_url();
+        let request = SourceCdnImagesRequest {
+            items: items
+                .into_iter()
+                .map(|(id, paths)| SourceCdnImagesItem { id, paths })
+                .collect(),
+            node: "edgeone",
+        };
+        let response = crate::net::default_client()
+            .post(format!("{base_url}/source-cdn/images"))
+            .header("X-ASTROBOX-TOKEN", token)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to request official CDN image URLs")?;
+        let status = response.status();
+        if status == StatusCode::FORBIDDEN {
+            return Err(anyhow!("官方加速源需要 AstroBox Pro"));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(anyhow!("图片加速请求过于频繁"));
+        }
+        let parsed = response
+            .error_for_status()
+            .context("official CDN image URL request failed")?
+            .json::<SourceCdnImagesResponse>()
+            .await
+            .context("failed to parse official CDN image URLs")?;
+        Ok(parsed
+            .results
+            .into_iter()
+            .map(|r| (r.id, r.images))
+            .collect())
+    }
+
+    // 把一组图片换成 base64 data URI，返回 cosKey -> data URI。
+    // 任一步失败/非 Pro/未镜像，相应图片不入表，调用方回退原始 URL（webview 直连）。
+    async fn inline_images(&self, refs: Vec<ImageRef>) -> HashMap<String, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        if refs.is_empty() {
+            return out;
+        }
+
+        // 按 cosKey 去重
+        let mut by_key: HashMap<String, ImageRef> = HashMap::new();
+        for r in refs {
+            let key = Self::image_cos_key(&r.owner, &r.repo, &r.commit, &r.rel);
+            by_key.entry(key).or_insert(r);
+        }
+
+        // 先吃缓存，剩下的按 id 分组去签发
+        let mut items: HashMap<String, Vec<String>> = HashMap::new();
+        let mut coords: HashMap<String, (String, String, String)> = HashMap::new();
+        for (key, r) in by_key {
+            if let Some(v) = self.image_cache_get(&key) {
+                out.insert(key, v.to_string());
+                continue;
+            }
+            items.entry(r.id.clone()).or_default().push(r.rel.clone());
+            coords
+                .entry(r.id.clone())
+                .or_insert((r.owner, r.repo, r.commit));
+        }
+        if items.is_empty() {
+            return out;
+        }
+
+        let signed = match self.resolve_source_cdn_image_urls(items).await {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("[OfficialV2] image sign failed: {err}");
+                return out; // 仅返回缓存命中，其余回退原始 URL
+            }
+        };
+
+        // 只内联加速直链；非加速(GitHub 兜底)留给调用方用原始 URL
+        let mut tasks = Vec::new();
+        for (id, entries) in signed {
+            let Some((owner, repo, commit)) = coords.get(&id).cloned() else {
+                continue;
+            };
+            for entry in entries {
+                if !entry.accelerated {
+                    continue;
+                }
+                let key =
+                    Self::image_cos_key(&owner, &repo, &commit, entry.path.trim_start_matches('/'));
+                let url = entry.url;
+                tasks.push(async move {
+                    match Self::fetch_image_data_uri(&url).await {
+                        Ok(data) => Some((key, data)),
+                        Err(err) => {
+                            log::warn!("[OfficialV2] inline image failed {key}: {err}");
+                            None
+                        }
+                    }
+                });
+            }
+        }
+
+        let results: Vec<Option<(String, String)>> = futures_util::stream::iter(tasks)
+            .buffer_unordered(IMAGE_INLINE_CONCURRENCY)
+            .collect()
+            .await;
+        for (key, data) in results.into_iter().flatten() {
+            self.image_cache_put(&key, &data);
+            out.insert(key, data);
+        }
+        out
     }
 
     pub async fn get_blog_markdown(&self, path: &str) -> anyhow::Result<String> {
@@ -467,9 +839,9 @@ impl CommunityProvider for OfficialV2Provider {
         }
 
         // 对过滤后的结果进行排序
-        let mut rng = rand::rng();
+        // 注意：ThreadRng 非 Send，必须在后续 .await 之前丢弃，故就地取用
         match &search.sort {
-            SortRuleV2::Random => filtered_index.shuffle(&mut rng),
+            SortRuleV2::Random => filtered_index.shuffle(&mut rand::rng()),
             SortRuleV2::Name => {
                 filtered_index.sort_by(|a, b| a.name.cmp(&b.name));
             }
@@ -514,6 +886,44 @@ impl CommunityProvider for OfficialV2Provider {
             });
         }
 
+        // 官方镜像源：把本页 icon/cover 经境内 CDN 内联为 base64，避免 webview 直连 GitHub
+        if self.cdn.load_full().uses_astrobox_source_cdn() {
+            let mut refs = Vec::new();
+            for item in target_page.iter() {
+                for rel in [item.icon.as_str(), item.cover.as_str()] {
+                    if let Some(rel) = Self::relative_image_path(rel) {
+                        refs.push(ImageRef {
+                            id: item.id.clone(),
+                            owner: item.repo_owner.clone(),
+                            repo: item.repo_name.clone(),
+                            commit: item.repo_commit_hash.clone(),
+                            rel,
+                        });
+                    }
+                }
+            }
+            let inlined = self.inline_images(refs).await;
+            if !inlined.is_empty() {
+                for (ret_item, idx) in ret.iter_mut().zip(target_page.iter()) {
+                    let key = |rel: &str| {
+                        Self::image_cos_key(
+                            &idx.repo_owner,
+                            &idx.repo_name,
+                            &idx.repo_commit_hash,
+                            rel.trim_start_matches('/'),
+                        )
+                    };
+                    if let Some(data) = inlined.get(&key(&idx.icon)) {
+                        ret_item.icon = data.clone();
+                    }
+                    if let Some(data) = inlined.get(&key(&idx.cover)) {
+                        ret_item.cover = data.clone();
+                        ret_item.preview = vec![data.clone()];
+                    }
+                }
+            }
+        }
+
         Ok(ret)
     }
 
@@ -555,14 +965,61 @@ impl CommunityProvider for OfficialV2Provider {
             }
 
             let base = self.build_repo_cdn_url_by_index_item(item);
-            let cover = self.resolve_repo_asset_url(&base, &manifest.item.cover);
-            let preview = manifest
+            let mut cover = self.resolve_repo_asset_url(&base, &manifest.item.cover);
+            let mut preview = manifest
                 .item
                 .preview
                 .iter()
                 .map(|p| self.resolve_repo_asset_url(&base, p))
                 .collect::<Vec<_>>();
-            let icon = self.resolve_repo_asset_url(&base, &item.icon);
+            let mut icon = self.resolve_repo_asset_url(&base, &item.icon);
+
+            // 官方镜像源：详情页图片同样经境内 CDN 内联为 base64
+            if self.cdn.load_full().uses_astrobox_source_cdn() {
+                let (owner, repo, commit) = (
+                    item.repo_owner.clone(),
+                    item.repo_name.clone(),
+                    item.repo_commit_hash.clone(),
+                );
+                let mut refs = Vec::new();
+                let rels = std::iter::once(item.icon.as_str())
+                    .chain(std::iter::once(manifest.item.cover.as_str()))
+                    .chain(manifest.item.preview.iter().map(|s| s.as_str()));
+                for rel in rels {
+                    if let Some(rel) = Self::relative_image_path(rel) {
+                        refs.push(ImageRef {
+                            id: item.id.clone(),
+                            owner: owner.clone(),
+                            repo: repo.clone(),
+                            commit: commit.clone(),
+                            rel,
+                        });
+                    }
+                }
+
+                let inlined = self.inline_images(refs).await;
+                if !inlined.is_empty() {
+                    let lookup = |rel: &str| -> Option<String> {
+                        let rel = Self::relative_image_path(rel)?;
+                        inlined
+                            .get(&Self::image_cos_key(&owner, &repo, &commit, &rel))
+                            .cloned()
+                    };
+                    if let Some(data) = lookup(&item.icon) {
+                        icon = data;
+                    }
+                    if let Some(data) = lookup(&manifest.item.cover) {
+                        cover = data;
+                    }
+                    preview = manifest
+                        .item
+                        .preview
+                        .iter()
+                        .zip(preview.into_iter())
+                        .map(|(rel, fallback)| lookup(rel).unwrap_or(fallback))
+                        .collect();
+                }
+            }
 
             Ok(ManifestV2 {
                 item: ManifestItemV2 {
@@ -603,11 +1060,12 @@ impl CommunityProvider for OfficialV2Provider {
             .with_context(|| format!("failed to fetch manifest for {}", item.name))?;
 
         let downloads = &manifest.downloads;
-        let download_entry = downloads
+        let (resolved_device, download_entry) = downloads
             .get(&device)
-            .or_else(|| downloads.get("default"))
-            .or_else(|| downloads.values().next())
-            .cloned()
+            .map(|entry| (device.as_str(), entry))
+            .or_else(|| downloads.get("default").map(|entry| ("default", entry)))
+            .or_else(|| downloads.iter().next().map(|(key, entry)| (key.as_str(), entry)))
+            .map(|(key, entry)| (key.to_string(), entry.clone()))
             .ok_or_else(|| anyhow!("no downloadable artifact for device `{device}`"))?;
 
         let mut file_name = download_entry.file_name.trim().to_string();
@@ -624,8 +1082,12 @@ impl CommunityProvider for OfficialV2Provider {
 
         let safe_file_name = sanitize_local_filename(&file_name);
 
-        let resolved_url = if let Some(url) = &download_entry.url {
-            (*self.cdn.load_full()).convert_url(url)
+        let cdn = *self.cdn.load_full();
+        let resolved_url = if cdn.uses_astrobox_source_cdn() {
+            self.resolve_source_cdn_download_url(&item.id, Some(&resolved_device))
+                .await?
+        } else if let Some(url) = &download_entry.url {
+            cdn.convert_url(url)
         } else {
             format!(
                 "{}/{}",
