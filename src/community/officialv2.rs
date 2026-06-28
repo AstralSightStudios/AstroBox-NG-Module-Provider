@@ -747,17 +747,26 @@ impl CommunityProvider for OfficialV2Provider {
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
         let resp = client.get(&url).send().await?.error_for_status()?;
         let raw = resp.bytes().await?;
+
+        let sanitized = strip_zero_width(&String::from_utf8_lossy(&raw));
         let mut list: Vec<IndexV2> = Vec::new();
-        let mut csv_read = csv::Reader::from_reader(raw.as_ref());
+        let mut csv_read = csv::ReaderBuilder::new()
+            .trim(csv::Trim::All)
+            .from_reader(sanitized.as_bytes());
         for it in csv_read.deserialize::<IndexV2>() {
-            if let Ok(mut i) = it {
-                if &i.id == "<placeholder>" {
-                    let n = self.placeholder_index.load_full().clone();
-                    self.placeholder_index.store(Arc::new(*n + 1));
-                    i.id = format!("placeholder_{}", n);
-                    list.push(i);
-                } else {
-                    list.push(i);
+            match it {
+                Ok(mut i) => {
+                    if &i.id == "<placeholder>" {
+                        let n = self.placeholder_index.load_full().clone();
+                        self.placeholder_index.store(Arc::new(*n + 1));
+                        i.id = format!("placeholder_{}", n);
+                        list.push(i);
+                    } else {
+                        list.push(i);
+                    }
+                }
+                Err(err) => {
+                    log::warn!("[OfficialV2] skipped malformed index_v2 row: {err}");
                 }
             }
         }
@@ -1231,6 +1240,13 @@ impl CommunityProvider for OfficialV2Provider {
         let resp = client.get(&url).send().await?.error_for_status()?;
         Ok(resp.content_length())
     }
+}
+
+fn strip_zero_width(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !matches!(*c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'))
+        .collect()
 }
 
 fn sanitize_local_filename(input: &str) -> String {
