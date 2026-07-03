@@ -736,23 +736,9 @@ impl OfficialV2Provider {
 
         Ok(entry)
     }
-}
 
-#[async_trait]
-impl CommunityProvider for OfficialV2Provider {
-    fn provider_name(&self) -> String {
-        "OfficialV2".to_string()
-    }
-    fn state(&self) -> ProviderState {
-        let state = self.state.load().clone();
-        (*state).clone()
-    }
-
-    async fn refresh(&self, cfg: &str) -> anyhow::Result<()> {
-        self.state.store(Arc::new(ProviderState::Updating));
-
-        //更新cdn
-
+    async fn refresh_inner(&self, cfg: &str) -> anyhow::Result<()> {
+        // 更新cdn
         let cfg: HashMap<String, _> = serde_json::from_str(cfg).unwrap_or(HashMap::new());
         let cdn: GitHubCdn = *cfg.get("cdn").unwrap_or(&GitHubCdn::Raw);
         self.cdn.store(Arc::new(cdn));
@@ -760,8 +746,17 @@ impl CommunityProvider for OfficialV2Provider {
 
         // 更新index
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
-        let resp = client.get(&url).send().await?.error_for_status()?;
-        let raw = resp.bytes().await?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to request index_v2.csv from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("index_v2.csv request failed ({url})"))?;
+        let raw = resp
+            .bytes()
+            .await
+            .context("failed to read index_v2.csv body")?;
 
         let sanitized = strip_zero_width(&String::from_utf8_lossy(&raw));
         let mut list: Vec<IndexV2> = Vec::new();
@@ -785,24 +780,75 @@ impl CommunityProvider for OfficialV2Provider {
                 }
             }
         }
+        // 拉到空索引基本意味着响应被 CDN 弄坏了；宁可报错也不要把
+        // 已有的良好索引覆盖成空。
+        if list.is_empty() {
+            anyhow::bail!("index_v2.csv parsed to an empty index");
+        }
         self.index.store(Arc::new(list));
         self.split_index(114514, SortRuleV2::Random);
 
         // 更新设备map
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
-        let resp = client.get(&url).send().await?.error_for_status()?;
-        let map: DeviceMapV2 = resp.json().await?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to request devices_v2.json from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("devices_v2.json request failed ({url})"))?;
+        let map: DeviceMapV2 = resp
+            .json()
+            .await
+            .context("failed to parse devices_v2.json")?;
         self.device_map.store(Arc::new(map));
 
         // 更新探索页
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
-        let resp = client.get(&url).send().await?.error_for_status()?;
-        let explore: serde_json::Value = resp.json().await?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to request explore_v2.json from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("explore_v2.json request failed ({url})"))?;
+        let explore: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse explore_v2.json")?;
         self.explore.store(Arc::new(explore));
 
-        self.state.store(Arc::new(ProviderState::Ready));
-
         Ok(())
+    }
+}
+
+#[async_trait]
+impl CommunityProvider for OfficialV2Provider {
+    fn provider_name(&self) -> String {
+        "OfficialV2".to_string()
+    }
+    fn state(&self) -> ProviderState {
+        let state = self.state.load().clone();
+        (*state).clone()
+    }
+
+    async fn refresh(&self, cfg: &str) -> anyhow::Result<()> {
+        self.state.store(Arc::new(ProviderState::Updating));
+
+        // 失败必须落到 Failed 态：否则 UI 永远停留在 Updating，
+        // 既看不到错误也不会触发重试。
+        match self.refresh_inner(cfg).await {
+            Ok(()) => {
+                self.state.store(Arc::new(ProviderState::Ready));
+                Ok(())
+            }
+            Err(err) => {
+                log::error!("[OfficialV2] refresh failed: {err:#}");
+                self.state
+                    .store(Arc::new(ProviderState::Failed(format!("{err:#}"))));
+                Err(err)
+            }
+        }
     }
 
     async fn get_page(
