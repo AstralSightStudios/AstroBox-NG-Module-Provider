@@ -296,6 +296,21 @@ impl OfficialV2Provider {
         )
     }
 
+    /// 构造「返回给前端展示的图片」base：与 [`build_repo_cdn_url`] 类似，但在「GitHub DoH」下
+    /// 走 `astrobox-ghdoh` 协议前缀，使前端原生 `<img>` 经 DoH 客户端回源。
+    pub fn build_repo_asset_url(&self, owner: &str, name: &str, commit_hash: &str) -> String {
+        let cdn = *self.cdn.load_full();
+        cdn.convert_asset_url(&self.build_repo_raw_url(owner, name, commit_hash))
+    }
+
+    pub fn build_repo_asset_url_by_index_item(&self, item: &IndexV2) -> String {
+        self.build_repo_asset_url(
+            &item.repo_owner,
+            &item.repo_name,
+            &item.repo_commit_hash,
+        )
+    }
+
     fn resolve_repo_asset_url(&self, base: &str, path: &str) -> String {
         if path.starts_with("http://")
             || path.starts_with("https://")
@@ -877,17 +892,17 @@ impl CommunityProvider for OfficialV2Provider {
                 name: item.name.clone(),
                 preview: vec![format!(
                     "{}/{}",
-                    self.build_repo_cdn_url_by_index_item(&item),
+                    self.build_repo_asset_url_by_index_item(&item),
                     item.cover.clone()
                 )],
                 icon: format!(
                     "{}/{}",
-                    self.build_repo_cdn_url_by_index_item(&item),
+                    self.build_repo_asset_url_by_index_item(&item),
                     item.icon.clone()
                 ),
                 cover: format!(
                     "{}/{}",
-                    self.build_repo_cdn_url_by_index_item(&item),
+                    self.build_repo_asset_url_by_index_item(&item),
                     item.cover.clone()
                 ),
                 paid_type: Some(item.paid_type.clone()),
@@ -975,7 +990,7 @@ impl CommunityProvider for OfficialV2Provider {
                 download.display_name = self.device_map_id_to_name(device_id);
             }
 
-            let base = self.build_repo_cdn_url_by_index_item(item);
+            let base = self.build_repo_asset_url_by_index_item(item);
             let mut cover = self.resolve_repo_asset_url(&base, &manifest.item.cover);
             let mut preview = manifest
                 .item
