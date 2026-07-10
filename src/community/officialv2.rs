@@ -46,6 +46,7 @@ const ASTROBOX_ACCOUNT_PROVIDER: &str = "astrobox";
 const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024; // 单张内联上限，超过则回退原始 URL
 const IMAGE_B64_CACHE_CAP: usize = 1024; // 内存缓存条数上限；内容按 commit 寻址、不可变
 const IMAGE_INLINE_CONCURRENCY: usize = 12; // 单页内联的并发抓取数
+const GITHUB_TOKEN_CACHE_TTL: Duration = Duration::from_secs(300); // GitHub access_token 内存缓存有效期
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +167,10 @@ pub struct OfficialV2Provider {
     placeholder_index: ArcSwap<u32>,
     // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
     image_b64_cache: Mutex<HashMap<String, Arc<str>>>,
+    // 已登录用户在 Raw CDN 下改走 GitHub API 时的 access_token 内存缓存。
+    // 三元组：(AstroBox token 标识, GitHub access_token, 获取时间)。
+    // 用 AstroBox token 作键，防止同一应用实例切换账号后复用旧用户的 GitHub token。
+    github_token_cache: Mutex<Option<(String, String, Instant)>>,
 }
 
 impl OfficialV2Provider {
@@ -181,6 +186,7 @@ impl OfficialV2Provider {
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             placeholder_index: ArcSwap::new(Arc::new(0)),
             image_b64_cache: Mutex::new(HashMap::new()),
+            github_token_cache: Mutex::new(None),
         }
     }
 
@@ -350,6 +356,171 @@ impl OfficialV2Provider {
             .token
             .filter(|token| !token.trim().is_empty())
             .ok_or_else(|| anyhow!("请先登录 AstroBox 账号"))
+    }
+
+    async fn current_github_token(&self) -> anyhow::Result<Option<String>> {
+        // 仅 Raw CDN 下才需要 GitHub API token
+        if *self.cdn.load_full() != GitHubCdn::Raw {
+            return Ok(None);
+        }
+
+        let astrobox_token = match self.current_astrobox_token().await {
+            Ok(token) => token,
+            Err(err) => {
+                log::debug!("[OfficialV2] skip github token: astrobox not logged in: {err}");
+                return Ok(None);
+            }
+        };
+
+        {
+            if let Ok(cache) = self.github_token_cache.lock() {
+                if let Some((key, token, fetched_at)) = cache.as_ref() {
+                    if key == &astrobox_token && fetched_at.elapsed() <= GITHUB_TOKEN_CACHE_TTL {
+                        return Ok(Some(token.clone()));
+                    }
+                }
+            }
+        }
+
+        let base_url = self.current_account_source().await.astrobox_api_base_url();
+        let response = match crate::net::default_client()
+            .get(format!("{base_url}/auth/api/github-token"))
+            .header("X-ASTROBOX-TOKEN", &astrobox_token)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                log::warn!("[OfficialV2] github token request network error: {err}");
+                return Ok(None);
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            log::warn!(
+                "[OfficialV2] github token request failed: {status}"
+            );
+            return Ok(None);
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct GithubTokenResponse {
+            #[serde(rename = "accessToken")]
+            access_token: String,
+        }
+
+        let payload = match response.json::<GithubTokenResponse>().await {
+            Ok(p) => p,
+            Err(err) => {
+                log::warn!("[OfficialV2] failed to parse github token response: {err}");
+                return Ok(None);
+            }
+        };
+        let token = payload.access_token.trim().to_string();
+        if token.is_empty() || token == "***" {
+            return Ok(None);
+        }
+
+        if let Ok(mut cache) = self.github_token_cache.lock() {
+            *cache = Some((astrobox_token, token.clone(), Instant::now()));
+        }
+        Ok(Some(token))
+    }
+
+    // 把 raw.githubusercontent.com 地址改写成 GitHub Contents API 地址，
+    // 带 ref 参数，请求时配合 Accept: application/vnd.github.raw 即可取回原始字节。
+    // 支持 commit hash 以及 `refs/heads/<单段分支名>` 形式的引用。
+    // 注意：多段分支名（如 refs/heads/feature/xxx）无法与路径可靠区分，
+    // 当前项目实际只使用 commit hash 和 refs/heads/main，故暂不支持。
+    fn raw_url_to_github_api(url: &str) -> Option<String> {
+        let rest = url.strip_prefix("https://raw.githubusercontent.com/")?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        let owner = parts[0];
+        let repo = parts[1];
+
+        // raw.githubusercontent.com/{owner}/{repo}/{ref...}/{path...}
+        // ref 可能是单段 commit hash，也可能是 refs/heads/<branch> 或 refs/tags/<tag>
+        let (git_ref, path_parts) = if parts[2] == "refs" {
+            if parts.len() < 6 {
+                return None;
+            }
+            (&parts[2..5], &parts[5..])
+        } else {
+            (&parts[2..3], &parts[3..])
+        };
+
+        let git_ref = git_ref.join("/");
+        let path = path_parts
+            .iter()
+            .map(|s| urlencoding::encode(s))
+            .collect::<Vec<_>>()
+            .join("/");
+
+        Some(format!(
+            "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={}",
+            urlencoding::encode(&git_ref)
+        ))
+    }
+
+    // 在 Raw CDN + 已登录且 Casdoor 存了 GitHub access_token 时，
+    // 改走 GitHub API（5000/h）以避免 raw.githubusercontent.com 的 429。
+    // 条件不满足或任何失败都返回 None，由调用方回退普通 raw 请求。
+    async fn try_fetch_via_github_api(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<Option<reqwest::Response>> {
+        if *self.cdn.load_full() != GitHubCdn::Raw {
+            return Ok(None);
+        }
+        let Some(token) = self.current_github_token().await? else {
+            return Ok(None);
+        };
+        let Some(api_url) = Self::raw_url_to_github_api(url) else {
+            return Ok(None);
+        };
+
+        let response = match crate::net::default_client()
+            .get(&api_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github.raw")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                log::warn!(
+                    "[OfficialV2] GitHub API request failed for {api_url}: {err}; fallback to raw"
+                );
+                return Ok(None);
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(Some(response));
+        }
+
+        log::warn!(
+            "[OfficialV2] GitHub API returned {status} for {api_url}; fallback to raw"
+        );
+        Ok(None)
+    }
+
+    // 统一 GET 入口：优先尝试 GitHub API（Raw+登录+有 token），失败或条件不满足则走原 URL。
+    async fn github_aware_get(&self, url: &str) -> anyhow::Result<reqwest::Response> {
+        if let Some(response) = self.try_fetch_via_github_api(url).await? {
+            return Ok(response);
+        }
+        Ok(crate::net::default_client()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?)
     }
 
     async fn resolve_source_cdn_download_url(
@@ -586,12 +757,9 @@ impl OfficialV2Provider {
             path
         );
         let url = cdn.convert_url(&raw_url);
-        let client = crate::net::default_client();
-        let resp = client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()
+        let resp = self
+            .github_aware_get(&url)
+            .await
             .with_context(|| format!("failed to fetch blog markdown from {}", url))?;
         let text = resp.text().await?;
 
@@ -647,15 +815,19 @@ impl OfficialV2Provider {
         let client = crate::net::default_client();
 
         let url_v2 = format!("{}/manifest_v2.json", base);
-        let resp_v2 = client.get(&url_v2).send().await?;
+        let resp_v2 = match self.try_fetch_via_github_api(&url_v2).await? {
+            Some(resp) => resp,
+            None => client.get(&url_v2).send().await?,
+        };
 
         if resp_v2.status() == reqwest::StatusCode::NOT_FOUND {
             // fallback v1 manifest
             let url_v1 = format!("{}/manifest.json", base);
-            let resp_v1 = client
-                .get(&url_v1)
-                .send()
-                .await?
+            let resp_v1 = match self.try_fetch_via_github_api(&url_v1).await? {
+                Some(resp) => resp,
+                None => client.get(&url_v1).send().await?,
+            };
+            let resp_v1 = resp_v1
                 .error_for_status()
                 .with_context(|| format!("failed to request legacy manifest `{url_v1}`"))?;
 
@@ -742,17 +914,12 @@ impl OfficialV2Provider {
         let cfg: HashMap<String, _> = serde_json::from_str(cfg).unwrap_or(HashMap::new());
         let cdn: GitHubCdn = *cfg.get("cdn").unwrap_or(&GitHubCdn::Raw);
         self.cdn.store(Arc::new(cdn));
-        let client = crate::net::default_client();
-
         // 更新index
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
-        let resp = client
-            .get(&url)
-            .send()
+        let resp = self
+            .github_aware_get(&url)
             .await
-            .with_context(|| format!("failed to request index_v2.csv from {url}"))?
-            .error_for_status()
-            .with_context(|| format!("index_v2.csv request failed ({url})"))?;
+            .with_context(|| format!("failed to request index_v2.csv from {url}"))?;
         let raw = resp
             .bytes()
             .await
@@ -790,13 +957,10 @@ impl OfficialV2Provider {
 
         // 更新设备map
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
-        let resp = client
-            .get(&url)
-            .send()
+        let resp = self
+            .github_aware_get(&url)
             .await
-            .with_context(|| format!("failed to request devices_v2.json from {url}"))?
-            .error_for_status()
-            .with_context(|| format!("devices_v2.json request failed ({url})"))?;
+            .with_context(|| format!("failed to request devices_v2.json from {url}"))?;
         let map: DeviceMapV2 = resp
             .json()
             .await
@@ -805,13 +969,10 @@ impl OfficialV2Provider {
 
         // 更新探索页
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
-        let resp = client
-            .get(&url)
-            .send()
+        let resp = self
+            .github_aware_get(&url)
             .await
-            .with_context(|| format!("failed to request explore_v2.json from {url}"))?
-            .error_for_status()
-            .with_context(|| format!("explore_v2.json request failed ({url})"))?;
+            .with_context(|| format!("failed to request explore_v2.json from {url}"))?;
         let explore: serde_json::Value = resp
             .json()
             .await
@@ -1181,12 +1342,25 @@ impl CommunityProvider for OfficialV2Provider {
             .as_nanos();
         let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, safe_file_name));
         let client = crate::net::default_client();
+        let response = match self.try_fetch_via_github_api(&resolved_url).await? {
+            Some(resp) => resp,
+            None => client
+                .get(&resolved_url)
+                .send()
+                .await
+                .with_context(|| format!("failed to request {}", resolved_url))?
+                .error_for_status()
+                .with_context(|| {
+                    format!("download request returned error for {}", resolved_url)
+                })?,
+        };
+
         let cleanup_path = tmp_path.clone();
         let download_result = {
-            let resolved_url = resolved_url;
             let final_path = final_path;
             let tmp_path = tmp_path;
             let progress_cb = progress_cb;
+            let response = response;
             async move {
                 let mut file = File::create(&tmp_path).await.with_context(|| {
                     format!("failed to create temp file {}", tmp_path.display())
@@ -1198,16 +1372,6 @@ impl CommunityProvider for OfficialV2Provider {
                         status: "".into(),
                     });
                 }
-
-                let response = client
-                    .get(&resolved_url)
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to request {}", resolved_url))?
-                    .error_for_status()
-                    .with_context(|| {
-                        format!("download request returned error for {}", resolved_url)
-                    })?;
 
                 let total = response.content_length();
                 let mut stream = response.bytes_stream();
@@ -1297,8 +1461,7 @@ impl CommunityProvider for OfficialV2Provider {
     ) -> anyhow::Result<Option<u64>> {
         let entry = self.resolve_download_entry(item_id, device, false).await?;
         let url = entry.url.clone().context("download url missing")?;
-        let client = crate::net::default_client();
-        let resp = client.get(&url).send().await?.error_for_status()?;
+        let resp = self.github_aware_get(&url).await?;
         Ok(resp.content_length())
     }
 }
@@ -1325,4 +1488,61 @@ fn sanitize_local_filename(input: &str) -> String {
     }
 
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_url_to_github_api_basic() {
+        assert_eq!(
+            OfficialV2Provider::raw_url_to_github_api(
+                "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv"
+            ),
+            Some("https://api.github.com/repos/AstralSightStudios/AstroBox-Repo/contents/index_v2.csv?ref=refs%2Fheads%2Fmain".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_url_to_github_api_with_commit_and_nested_path() {
+        assert_eq!(
+            OfficialV2Provider::raw_url_to_github_api(
+                "https://raw.githubusercontent.com/owner/repo/abc123/manifest_v2.json"
+            ),
+            Some("https://api.github.com/repos/owner/repo/contents/manifest_v2.json?ref=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_url_to_github_api_encodes_path() {
+        assert_eq!(
+            OfficialV2Provider::raw_url_to_github_api(
+                "https://raw.githubusercontent.com/owner/repo/abc123/path/with spaces/file.json"
+            ),
+            Some("https://api.github.com/repos/owner/repo/contents/path/with%20spaces/file.json?ref=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_url_to_github_api_rejects_non_raw() {
+        assert_eq!(
+            OfficialV2Provider::raw_url_to_github_api(
+                "https://example.com/owner/repo/abc123/file.json"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_url_to_github_api_multi_segment_branch_is_documented_limitation() {
+        // 多段分支名无法与路径可靠区分，当前实现按 refs/heads/{第一段} 解析。
+        // 这是已知限制；项目实际只使用 commit hash 和 refs/heads/main。
+        assert_eq!(
+            OfficialV2Provider::raw_url_to_github_api(
+                "https://raw.githubusercontent.com/owner/repo/refs/heads/feature/xxx/file.json"
+            ),
+            Some("https://api.github.com/repos/owner/repo/contents/xxx/file.json?ref=refs%2Fheads%2Ffeature".to_string())
+        );
+    }
 }
