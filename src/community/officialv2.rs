@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -155,6 +155,219 @@ fn guess_image_mime(url: &str) -> &'static str {
     }
 }
 
+const COMMUNITY_REPO_OWNER: &str = "AstralSightStudios";
+const COMMUNITY_REPO_NAME: &str = "AstroBox-Repo";
+const COMMUNITY_REPO_COMMIT: &str = "refs/heads/main";
+const COMMUNITY_REPO_INLINE_ID: &str = "__astrobox_community__";
+
+/// 构造社区仓 blogs 目录下的 raw URL（用于相对路径）。
+fn build_community_blogs_raw_url(rel: &str) -> String {
+    format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/blogs/{}",
+        COMMUNITY_REPO_OWNER,
+        COMMUNITY_REPO_NAME,
+        COMMUNITY_REPO_COMMIT,
+        rel.trim_start_matches('/')
+    )
+}
+
+/// 判断 URL 是否属于当前社区 raw 源，并返回仓内相对路径。
+fn parse_community_repo_raw_url(url: &str) -> Option<String> {
+    let prefix = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/",
+        COMMUNITY_REPO_OWNER, COMMUNITY_REPO_NAME, COMMUNITY_REPO_COMMIT
+    );
+    url.strip_prefix(&prefix).map(|s| s.to_string())
+}
+
+/// 判断字符串是否为绝对 URL（含协议或 // 开头）。
+fn is_absolute_url(value: &str) -> bool {
+    static ABSOLUTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:[a-zA-Z][a-zA-Z0-9+.\-]*:|//)").unwrap()
+    });
+    ABSOLUTE_RE.is_match(value.trim())
+}
+
+/// 把探索页资源字段解析为可直接按 CDN 改写的 raw URL。
+fn resolve_explore_v2p1_asset_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_owned();
+    }
+    if is_absolute_url(trimmed) {
+        trimmed.to_owned()
+    } else {
+        build_community_blogs_raw_url(trimmed)
+    }
+}
+
+/// 移除 JSONC 中的行注释与块注释，保留字符串字面量内容。
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut in_block = false;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if in_block {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            in_block = true;
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 移除 JSON 中数组/对象末尾的多余逗号，保留字符串内的逗号。
+fn strip_trailing_commas(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            continue;
+        }
+        if ch == ',' {
+            let mut found_closer = false;
+            let mut cloned = chars.clone();
+            while let Some(&c) = cloned.peek() {
+                if c.is_whitespace() {
+                    cloned.next();
+                } else if c == ']' || c == '}' {
+                    found_closer = true;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if found_closer {
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn parse_jsonc(input: &str) -> anyhow::Result<serde_json::Value> {
+    let text = strip_jsonc_comments(input);
+    let text = strip_trailing_commas(&text);
+    serde_json::from_str(&text).context("failed to parse JSONC as JSON")
+}
+
+#[derive(Clone)]
+enum PathSegment {
+    Key(String),
+    Index(usize),
+}
+
+struct ExploreAssetRef {
+    path: Vec<PathSegment>,
+    raw_url: String,
+}
+
+fn set_value_at_path(value: &mut serde_json::Value, path: &[PathSegment], new_value: serde_json::Value) {
+    let mut current = value;
+    if path.is_empty() {
+        return;
+    }
+    for seg in &path[..path.len() - 1] {
+        match seg {
+            PathSegment::Key(k) => current = current.get_mut(k.as_str()).unwrap(),
+            PathSegment::Index(i) => current = current.get_mut(*i).unwrap(),
+        }
+    }
+    match &path[path.len() - 1] {
+        PathSegment::Key(k) => current[k.as_str()] = new_value,
+        PathSegment::Index(i) => current[*i] = new_value,
+    }
+}
+
+fn collect_explore_v2p1_assets(value: &serde_json::Value, path: &mut Vec<PathSegment>, out: &mut Vec<ExploreAssetRef>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if (k == "backgroundImg" || k == "avatarUrl") && v.is_string() {
+                    if let Some(s) = v.as_str() {
+                        let raw_url = resolve_explore_v2p1_asset_url(s);
+                        let mut asset_path = path.clone();
+                        asset_path.push(PathSegment::Key(k.clone()));
+                        out.push(ExploreAssetRef { path: asset_path, raw_url });
+                    }
+                }
+                path.push(PathSegment::Key(k.clone()));
+                collect_explore_v2p1_assets(v, path, out);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                path.push(PathSegment::Index(i));
+                collect_explore_v2p1_assets(v, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
 pub struct OfficialV2Provider {
     cdn: ArcSwap<GitHubCdn>,
     app_handle: AppHandle,
@@ -162,7 +375,7 @@ pub struct OfficialV2Provider {
     splited_index: ArcSwap<Vec<Vec<IndexV2>>>,
     splited_limit: ArcSwap<usize>,
     device_map: ArcSwap<DeviceMapV2>,
-    explore: ArcSwap<String>,
+    explore: ArcSwap<serde_json::Value>,
     state: ArcSwap<ProviderState>,
     placeholder_index: ArcSwap<u32>,
     // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
@@ -182,7 +395,7 @@ impl OfficialV2Provider {
             splited_index: ArcSwap::new(Arc::new(Vec::new())),
             splited_limit: ArcSwap::new(Arc::new(0)),
             device_map: ArcSwap::new(Arc::new(DeviceMapV2::default())),
-            explore: ArcSwap::new(Arc::new(String::new())),
+            explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             placeholder_index: ArcSwap::new(Arc::new(0)),
             image_b64_cache: Mutex::new(HashMap::new()),
@@ -226,8 +439,61 @@ impl OfficialV2Provider {
         all
     }
 
-    pub fn explore(&self) -> Arc<String> {
+    pub fn explore(&self) -> Arc<serde_json::Value> {
         self.explore.load().clone()
+    }
+
+    /// 把 explore_v2p1.jsonc 解析后的 payload 里所有图片 URL 按当前 CDN 改写。
+    /// 当选中 AstroBox Pro 源 CDN 时，社区仓图片会经 `/source-cdn/images`
+    /// 签成直链并内联为 base64 data URI，行为与全部资源页/详情页保持一致。
+    async fn normalize_explore_v2p1_payload(&self, value: &mut serde_json::Value) -> anyhow::Result<()> {
+        let cdn = *self.cdn.load_full();
+        let mut refs = Vec::new();
+        collect_explore_v2p1_assets(value, &mut Vec::new(), &mut refs);
+
+        let inline_refs: Vec<ImageRef> = if cdn.uses_astrobox_source_cdn() {
+            refs.iter()
+                .filter(|r| parse_community_repo_raw_url(&r.raw_url).is_some())
+                .map(|r| {
+                    let rel = parse_community_repo_raw_url(&r.raw_url).unwrap();
+                    ImageRef {
+                        id: COMMUNITY_REPO_INLINE_ID.to_string(),
+                        owner: COMMUNITY_REPO_OWNER.to_string(),
+                        repo: COMMUNITY_REPO_NAME.to_string(),
+                        commit: COMMUNITY_REPO_COMMIT.to_string(),
+                        rel,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let inlined = if inline_refs.is_empty() {
+            HashMap::new()
+        } else {
+            self.inline_images(inline_refs).await
+        };
+
+        for r in refs {
+            let new_url = if let Some(rel) = parse_community_repo_raw_url(&r.raw_url) {
+                let key = Self::image_cos_key(
+                    COMMUNITY_REPO_OWNER,
+                    COMMUNITY_REPO_NAME,
+                    COMMUNITY_REPO_COMMIT,
+                    &rel,
+                );
+                if let Some(data_uri) = inlined.get(&key) {
+                    data_uri.clone()
+                } else {
+                    cdn.convert_asset_url(&r.raw_url)
+                }
+            } else {
+                cdn.convert_asset_url(&r.raw_url)
+            };
+            set_value_at_path(value, &r.path, serde_json::Value::String(new_url));
+        }
+        Ok(())
     }
 
     pub fn device_map_id_to_name(&self, id: &str) -> Option<String> {
@@ -977,7 +1243,12 @@ impl OfficialV2Provider {
             .text()
             .await
             .context("failed to read explore_v2p1.jsonc body")?;
-        self.explore.store(Arc::new(text));
+        let mut explore: serde_json::Value = parse_jsonc(&text)
+            .with_context(|| format!("failed to parse explore_v2p1.jsonc from {url}"))?;
+        self.normalize_explore_v2p1_payload(&mut explore)
+            .await
+            .context("failed to normalize explore_v2p1.jsonc")?;
+        self.explore.store(Arc::new(explore));
 
         Ok(())
     }
@@ -1544,5 +1815,98 @@ mod tests {
             ),
             Some("https://api.github.com/repos/owner/repo/contents/xxx/file.json?ref=refs%2Fheads%2Ffeature".to_string())
         );
+    }
+
+    #[test]
+    fn parse_jsonc_strips_comments_and_trailing_commas() {
+        let input = r#"{
+            // line comment
+            "url": "https://example.com//path",
+            "cards": [
+                { "id": 1, }, /* block */
+                { "id": 2, },
+            ],
+        }"#;
+        let value = parse_jsonc(input).unwrap();
+        assert_eq!(value["url"], "https://example.com//path");
+        assert_eq!(value["cards"][0]["id"], 1);
+        assert_eq!(value["cards"][1]["id"], 2);
+    }
+
+    #[test]
+    fn parse_jsonc_rejects_invalid_json() {
+        assert!(parse_jsonc("{ not json").is_err());
+    }
+
+    #[test]
+    fn is_absolute_url_matches_schemes_and_relative() {
+        assert!(is_absolute_url("https://raw.githubusercontent.com/a/b/c.png"));
+        assert!(is_absolute_url("data:image/png;base64,xxx"));
+        assert!(is_absolute_url("//example.com/x.png"));
+        assert!(!is_absolute_url("blogs/hero/a.png"));
+        assert!(!is_absolute_url(""));
+    }
+
+    #[test]
+    fn parse_community_repo_raw_url_roundtrip() {
+        let raw = "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/hero/a.png";
+        assert_eq!(
+            parse_community_repo_raw_url(raw),
+            Some("blogs/hero/a.png".to_string())
+        );
+        assert_eq!(
+            parse_community_repo_raw_url("https://raw.githubusercontent.com/other/repo/main/x.png"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_explore_v2p1_asset_url_resolves_relative() {
+        assert_eq!(
+            resolve_explore_v2p1_asset_url("hero/a.png"),
+            "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/hero/a.png"
+        );
+        assert_eq!(
+            resolve_explore_v2p1_asset_url("https://cdn.example.com/a.png"),
+            "https://cdn.example.com/a.png"
+        );
+        assert_eq!(resolve_explore_v2p1_asset_url(""), "");
+    }
+
+    #[test]
+    fn set_value_at_path_nested_keys_and_indexes() {
+        let mut value = serde_json::json!({
+            "sections": [ { "cards": [ { "backgroundImg": "old.png" } ] } ]
+        });
+        let path = vec![
+            PathSegment::Key("sections".into()),
+            PathSegment::Index(0),
+            PathSegment::Key("cards".into()),
+            PathSegment::Index(0),
+            PathSegment::Key("backgroundImg".into()),
+        ];
+        set_value_at_path(&mut value, &path, serde_json::Value::String("new.png".into()));
+        assert_eq!(value["sections"][0]["cards"][0]["backgroundImg"], "new.png");
+    }
+
+    #[test]
+    fn collect_explore_v2p1_assets_finds_asset_fields() {
+        let value = serde_json::json!({
+            "customSections": [],
+            "sections": [
+                {
+                    "cards": [
+                        { "type": "blog", "backgroundImg": "hero/a.png", "url": "https://x" },
+                        { "type": "author", "avatarUrl": "authors/b.png" },
+                        { "type": "resource", "resourceId": "r1" },
+                    ]
+                }
+            ]
+        });
+        let mut refs = Vec::new();
+        collect_explore_v2p1_assets(&value, &mut Vec::new(), &mut refs);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].raw_url, "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/hero/a.png");
+        assert_eq!(refs[1].raw_url, "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/authors/b.png");
     }
 }
