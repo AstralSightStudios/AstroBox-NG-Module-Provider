@@ -162,7 +162,7 @@ pub struct OfficialV2Provider {
     splited_index: ArcSwap<Vec<Vec<IndexV2>>>,
     splited_limit: ArcSwap<usize>,
     device_map: ArcSwap<DeviceMapV2>,
-    explore: ArcSwap<serde_json::Value>,
+    explore: ArcSwap<String>,
     state: ArcSwap<ProviderState>,
     placeholder_index: ArcSwap<u32>,
     // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
@@ -182,7 +182,7 @@ impl OfficialV2Provider {
             splited_index: ArcSwap::new(Arc::new(Vec::new())),
             splited_limit: ArcSwap::new(Arc::new(0)),
             device_map: ArcSwap::new(Arc::new(DeviceMapV2::default())),
-            explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
+            explore: ArcSwap::new(Arc::new(String::new())),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             placeholder_index: ArcSwap::new(Arc::new(0)),
             image_b64_cache: Mutex::new(HashMap::new()),
@@ -226,7 +226,7 @@ impl OfficialV2Provider {
         all
     }
 
-    pub fn explore(&self) -> Arc<serde_json::Value> {
+    pub fn explore(&self) -> Arc<String> {
         self.explore.load().clone()
     }
 
@@ -968,16 +968,16 @@ impl OfficialV2Provider {
         self.device_map.store(Arc::new(map));
 
         // 更新探索页
-        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2.json");
+        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2p1.jsonc");
         let resp = self
             .github_aware_get(&url)
             .await
-            .with_context(|| format!("failed to request explore_v2.json from {url}"))?;
-        let explore: serde_json::Value = resp
-            .json()
+            .with_context(|| format!("failed to request explore_v2p1.jsonc from {url}"))?;
+        let text = resp
+            .text()
             .await
-            .context("failed to parse explore_v2.json")?;
-        self.explore.store(Arc::new(explore));
+            .context("failed to read explore_v2p1.jsonc body")?;
+        self.explore.store(Arc::new(text));
 
         Ok(())
     }
