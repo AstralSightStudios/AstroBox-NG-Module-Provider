@@ -16,6 +16,24 @@ fn ghdoh_base() -> Option<String> {
     GHDOH_BASE.read().ok().and_then(|guard| guard.clone())
 }
 
+/// GitCode 镜像仓（[`GitHubCdn::Xuanwu`]/[`GitHubCdn::Jieyuan`]）仅镜像了官方源仓
+/// `AstralSightStudios/AstroBox-Repo`。仅该前缀的原始文件存在于镜像仓中；第三方资源仓库
+/// 的文件（资源详情 manifest、固件、插件等）不在镜像仓内，改写过去必然 404，须保持 GitHub 直连。
+const GITCODE_MIRRORED_REPO_PREFIX: &str =
+    "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/";
+
+/// GitCode 镜像仓信息。数据文件（文本，可能 >30KB——`raw.gitcode.com` 对较大文件返回
+/// 403「暂不支持预览」）改写为 GitCode API contents 接口并解码 base64；小文件（图片等）
+/// 仍走 `raw.gitcode.com` 直出。
+struct GitCodeMirror {
+    /// GitCode API contents 前缀（数据文件 URL 基座，尾部拼 `?format=raw&ref=<branch>`）。
+    api_prefix: &'static str,
+    /// `raw.gitcode.com` 前缀（小文件直出，用于图片等二进制）。
+    raw_prefix: &'static str,
+    /// 镜像仓分支。
+    branch: &'static str,
+}
+
 /// GitHub 资源加速 CDN。
 ///
 /// 前缀型代理镜像（[`GitHubCdn::proxy_prefix`] 返回 `Some`）通过在原始 URL 前拼接代理域名
@@ -30,24 +48,42 @@ pub enum GitHubCdn {
     GitHubDoh,
     AstroBoxProMirror,
     AstroBoxProMirrorWaterFlames,
+    /// host 替换型赞助镜像（数据链路与 Raw 一致）：`mirror.abox.run` 直接替换
+    /// `raw.githubusercontent.com` 域名，而非在完整 URL 前拼接代理前缀。
+    /// Pro 会员门槛仅由前端拦截（isOfficialProCdn 锁定 + 设置页 disabled），后端无 VIP 校验——
+    /// 与 WaterFlames 不同（后者走 /source-cdn 由 AstroBox 服务端 403 兜底）。
+    /// 已知妥协：非 Pro 用户若直接改写持久化配置绕过前端门槛，mirror.abox.run
+    /// 是否自行鉴权由该外部服务决定，本仓库无法兜底。
+    AboxMirror,
     GhFast,
     GhProxy,
     GhProxyOrg,
     GhDdlc,
     Isteed,
+    /// GitCode API 型免费镜像：数据文件改写为 GitCode API contents 接口
+    /// （`raw.gitcode.com` 对较大文件返回 403「暂不支持预览」，API 返回 base64 JSON，
+    /// 由拉取层 `github_aware_bytes` 解码）；小文件（图片等）走 `raw.gitcode.com` 直出。
+    /// 免费开放，无 Pro 门槛；数据链路与 Raw 一致。
+    Xuanwu,
+    /// GitCode API 型免费镜像：`Bikboke/abmirror` 镜像仓，行为同 [`GitHubCdn::Xuanwu`]。
+    /// 免费开放，无 Pro 门槛；数据链路与 Raw 一致。
+    Jieyuan,
 }
 
 impl GitHubCdn {
     /// 社区可选 CDN（含中国大陆赞助镜像，用于测速；赞助项是否展示由前端控制）。
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 11] = [
         GitHubCdn::Raw,
         GitHubCdn::GitHubDoh,
         GitHubCdn::AstroBoxProMirrorWaterFlames,
+        GitHubCdn::AboxMirror,
         GitHubCdn::GhFast,
         GitHubCdn::GhProxy,
         GitHubCdn::GhProxyOrg,
         GitHubCdn::GhDdlc,
         GitHubCdn::Isteed,
+        GitHubCdn::Xuanwu,
+        GitHubCdn::Jieyuan,
     ];
 
     /// 序列化标识（与 serde 变体名一致，前端以此作为 CDN id）。
@@ -57,11 +93,14 @@ impl GitHubCdn {
             GitHubCdn::GitHubDoh => "GitHubDoh",
             GitHubCdn::AstroBoxProMirror => "AstroBoxProMirror",
             GitHubCdn::AstroBoxProMirrorWaterFlames => "AstroBoxProMirrorWaterFlames",
+            GitHubCdn::AboxMirror => "AboxMirror",
             GitHubCdn::GhFast => "GhFast",
             GitHubCdn::GhProxy => "GhProxy",
             GitHubCdn::GhProxyOrg => "GhProxyOrg",
             GitHubCdn::GhDdlc => "GhDdlc",
             GitHubCdn::Isteed => "Isteed",
+            GitHubCdn::Xuanwu => "Xuanwu",
+            GitHubCdn::Jieyuan => "Jieyuan",
         }
     }
 
@@ -77,7 +116,8 @@ impl GitHubCdn {
         }
     }
 
-    /// 前缀型代理镜像的 URL 前缀；直连（`Raw`）与赞助镜像返回 `None`。
+    /// 前缀型代理镜像的 URL 前缀；直连（`Raw`）、DoH、source-cdn 型赞助镜像、
+    /// host 替换型（`AboxMirror`）与 GitCode API 型（`Xuanwu`/`Jieyuan`）返回 `None`。
     fn proxy_prefix(self) -> Option<&'static str> {
         match self.normalized() {
             GitHubCdn::GhFast => Some("https://ghfast.top/"),
@@ -88,13 +128,77 @@ impl GitHubCdn {
             GitHubCdn::Raw
             | GitHubCdn::GitHubDoh
             | GitHubCdn::AstroBoxProMirror
-            | GitHubCdn::AstroBoxProMirrorWaterFlames => None,
+            | GitHubCdn::AstroBoxProMirrorWaterFlames
+            | GitHubCdn::AboxMirror
+            | GitHubCdn::Xuanwu
+            | GitHubCdn::Jieyuan => None,
         }
+    }
+
+    /// Host 替换型镜像的 (旧域名前缀, 新域名前缀)：直接把 `raw.githubusercontent.com` 域名
+    /// 替换为镜像域名（如 `https://mirror.abox.run/owner/repo/...`），而非在完整 URL 前
+    /// 拼接代理前缀。目前仅 `AboxMirror`（赞助）命中，其余返回 `None`
+    /// （`Xuanwu`/`Jieyuan` 的 `raw.gitcode.com` 前缀见 [`GitHubCdn::gitcode_mirror`]）。
+    fn host_rewrite(self) -> Option<(&'static str, &'static str)> {
+        match self.normalized() {
+            GitHubCdn::AboxMirror => {
+                Some(("https://raw.githubusercontent.com/", "https://mirror.abox.run/"))
+            }
+            _ => None,
+        }
+    }
+
+    /// GitCode 镜像仓信息（`Xuanwu`/`Jieyuan` 命中，其余 `None`）。
+    fn gitcode_mirror(self) -> Option<GitCodeMirror> {
+        match self.normalized() {
+            GitHubCdn::Xuanwu => Some(GitCodeMirror {
+                api_prefix:
+                    "https://api.gitcode.com/api/v5/repos/gcw_MdSkpmRq/AstroBox-Repo-Mirror/contents/",
+                raw_prefix:
+                    "https://raw.gitcode.com/gcw_MdSkpmRq/AstroBox-Repo-Mirror/raw/main/",
+                branch: "main",
+            }),
+            GitHubCdn::Jieyuan => Some(GitCodeMirror {
+                api_prefix:
+                    "https://api.gitcode.com/api/v5/repos/Bikboke/abmirror/contents/",
+                raw_prefix: "https://raw.gitcode.com/Bikboke/abmirror/raw/main/",
+                branch: "main",
+            }),
+            _ => None,
+        }
+    }
+
+    /// GitCode 镜像仓只镜像官方源仓：仅 `AstralSightStudios/AstroBox-Repo` 前缀命中，
+    /// 返回去掉 `https://raw.githubusercontent.com/` 后的路径（保留 `AstralSightStudios/AstroBox-Repo/` 段）；
+    /// 其它仓库文件（第三方资源 manifest、固件等）不在镜像仓内，返回 `None` 保持 GitHub 直连。
+    fn gitcode_repo_rest(url: &str) -> Option<&str> {
+        if !url.starts_with(GITCODE_MIRRORED_REPO_PREFIX) {
+            return None;
+        }
+        url.strip_prefix("https://raw.githubusercontent.com/")
     }
 
     pub fn convert_url(self, url: &str) -> String {
         if !is_convertible_github_url(url) {
             return url.to_owned();
+        }
+
+        // GitCode 镜像仓（Xuanwu/Jieyuan）：数据文件改走 GitCode API contents 接口
+        // （raw.gitcode.com 对 >~30KB 的文件返回 403「暂不支持预览」；API 返回 base64
+        // JSON，由拉取层 github_aware_bytes 解码）。镜像仓只镜像官方源仓，其它仓库
+        // 文件不在镜像仓内，保持 GitHub 直连。
+        if let Some(mirror) = self.gitcode_mirror() {
+            return match Self::gitcode_repo_rest(url) {
+                Some(rest) => format!(
+                    "{}{}?format=raw&ref={}",
+                    mirror.api_prefix, rest, mirror.branch
+                ),
+                None => url.to_owned(),
+            };
+        }
+
+        if let Some((from, to)) = self.host_rewrite() {
+            return url.replacen(from, to, 1);
         }
 
         match self.proxy_prefix() {
@@ -114,6 +218,14 @@ impl GitHubCdn {
                 }
             }
             return url.to_owned();
+        }
+        // GitCode 镜像仓的图片/二进制（通常为小文件）：保持 raw.gitcode.com host 替换
+        // 直出原始内容（API 返回 base64 JSON，不适合 <img> 直接消费）。仅限官方源仓文件。
+        if let Some(mirror) = self.gitcode_mirror() {
+            return match Self::gitcode_repo_rest(url) {
+                Some(rest) => format!("{}{}", mirror.raw_prefix, rest),
+                None => url.to_owned(),
+            };
         }
         self.convert_url(url)
     }
@@ -201,6 +313,98 @@ mod tests {
     fn pro_mirror_does_not_rewrite() {
         let url = "https://raw.githubusercontent.com/owner/repo/main/index.csv";
         assert_eq!(GitHubCdn::AstroBoxProMirrorWaterFlames.convert_url(url), url);
+    }
+
+    #[test]
+    fn abox_mirror_rewrites_as_host_replace() {
+        let url = "https://raw.githubusercontent.com/owner/repo/main/index.csv";
+        assert_eq!(
+            GitHubCdn::AboxMirror.convert_url(url),
+            "https://mirror.abox.run/owner/repo/main/index.csv"
+        );
+        // 非 GitHub 地址不动；图片改写与普通改写一致。
+        assert_eq!(
+            GitHubCdn::AboxMirror.convert_url("https://example.com/file.bin"),
+            "https://example.com/file.bin"
+        );
+        assert_eq!(
+            GitHubCdn::AboxMirror.convert_asset_url(url),
+            GitHubCdn::AboxMirror.convert_url(url)
+        );
+        // 数据获取与 Raw 一致：不走 AstroBox source-cdn 签名/内联。
+        assert!(!GitHubCdn::AboxMirror.uses_astrobox_source_cdn());
+    }
+
+    #[test]
+    fn xuanwu_uses_gitcode_api() {
+        let url = "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv";
+        // 数据文件改写为 GitCode API contents（raw.gitcode.com 对较大文件 403）。
+        assert_eq!(
+            GitHubCdn::Xuanwu.convert_url(url),
+            "https://api.gitcode.com/api/v5/repos/gcw_MdSkpmRq/AstroBox-Repo-Mirror/contents/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv?format=raw&ref=main"
+        );
+        // 镜像仓只镜像官方源仓：第三方资源仓库文件保持 GitHub 直连。
+        let third_party =
+            "https://raw.githubusercontent.com/some/other-repo/main/manifest.json";
+        assert_eq!(GitHubCdn::Xuanwu.convert_url(third_party), third_party);
+        // gist / release / archive 无官方源仓前缀 → 同样保持直连。
+        let gist = "https://gist.githubusercontent.com/user/gist/raw/file.txt";
+        assert_eq!(GitHubCdn::Xuanwu.convert_url(gist), gist);
+        let release =
+            "https://github.com/some/repo/releases/download/v1.0/app.zip";
+        assert_eq!(GitHubCdn::Xuanwu.convert_url(release), release);
+        // 非 GitHub 地址不动。
+        let ext = "https://example.com/file.bin";
+        assert_eq!(GitHubCdn::Xuanwu.convert_url(ext), ext);
+        // 图片/二进制走 raw.gitcode.com host 替换直出（API 返回 base64 JSON 不适合 <img>）。
+        assert_eq!(
+            GitHubCdn::Xuanwu.convert_asset_url(url),
+            "https://raw.gitcode.com/gcw_MdSkpmRq/AstroBox-Repo-Mirror/raw/main/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv"
+        );
+        // 第三方图片保持直连。
+        assert_eq!(GitHubCdn::Xuanwu.convert_asset_url(third_party), third_party);
+        // 测速探测 URL（官方源仓）走 API 改写。
+        assert_eq!(
+            GitHubCdn::Xuanwu.probe_url(url),
+            "https://api.gitcode.com/api/v5/repos/gcw_MdSkpmRq/AstroBox-Repo-Mirror/contents/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv?format=raw&ref=main"
+        );
+        // 数据获取与 Raw 一致：不走 AstroBox source-cdn 签名/内联。
+        assert!(!GitHubCdn::Xuanwu.uses_astrobox_source_cdn());
+    }
+
+    #[test]
+    fn jieyuan_uses_gitcode_api() {
+        let url = "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv";
+        assert_eq!(
+            GitHubCdn::Jieyuan.convert_url(url),
+            "https://api.gitcode.com/api/v5/repos/Bikboke/abmirror/contents/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv?format=raw&ref=main"
+        );
+        // 第三方资源仓库文件保持 GitHub 直连。
+        let third_party =
+            "https://raw.githubusercontent.com/some/other-repo/main/manifest.json";
+        assert_eq!(GitHubCdn::Jieyuan.convert_url(third_party), third_party);
+        // gist / release / archive 无官方源仓前缀 → 同样保持直连。
+        let gist = "https://gist.githubusercontent.com/user/gist/raw/file.txt";
+        assert_eq!(GitHubCdn::Jieyuan.convert_url(gist), gist);
+        let release =
+            "https://github.com/some/repo/releases/download/v1.0/app.zip";
+        assert_eq!(GitHubCdn::Jieyuan.convert_url(release), release);
+        // 非 GitHub 地址不动。
+        let ext = "https://example.com/file.bin";
+        assert_eq!(GitHubCdn::Jieyuan.convert_url(ext), ext);
+        // 图片/二进制走 raw.gitcode.com host 替换直出。
+        assert_eq!(
+            GitHubCdn::Jieyuan.convert_asset_url(url),
+            "https://raw.gitcode.com/Bikboke/abmirror/raw/main/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv"
+        );
+        assert_eq!(GitHubCdn::Jieyuan.convert_asset_url(third_party), third_party);
+        // 测速探测 URL（官方源仓）走 API 改写。
+        assert_eq!(
+            GitHubCdn::Jieyuan.probe_url(url),
+            "https://api.gitcode.com/api/v5/repos/Bikboke/abmirror/contents/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv?format=raw&ref=main"
+        );
+        // 数据获取与 Raw 一致：不走 AstroBox source-cdn 签名/内联。
+        assert!(!GitHubCdn::Jieyuan.uses_astrobox_source_cdn());
     }
 
     #[test]

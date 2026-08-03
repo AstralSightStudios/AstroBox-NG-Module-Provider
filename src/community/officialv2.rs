@@ -789,6 +789,28 @@ impl OfficialV2Provider {
             .error_for_status()?)
     }
 
+    // 统一 GET 并把响应体读成字节；对 GitCode API（Xuanwu/Jieyuan 数据文件）返回的
+    // base64 JSON 包装（{"type":"file","encoding":"base64","content":...}）自动解码回
+    // 原始字节。其余源（raw.githubusercontent.com / GitHub API / 前缀代理）响应为纯
+    // 内容，原样返回。type=="file" 判别用于排除任意 JSON 恰好含这两键的理论误伤。
+    async fn github_aware_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        let resp = self.github_aware_get(url).await?;
+        let bytes = resp.bytes().await?.to_vec();
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if value.get("type").and_then(|t| t.as_str()) == Some("file")
+                && value.get("encoding").and_then(|e| e.as_str()) == Some("base64")
+            {
+                if let Some(content) = value.get("content").and_then(|c| c.as_str()) {
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(content)
+                    {
+                        return Ok(decoded);
+                    }
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     async fn resolve_source_cdn_download_url(
         &self,
         item_id: &str,
@@ -1023,11 +1045,11 @@ impl OfficialV2Provider {
             path
         );
         let url = cdn.convert_url(&raw_url);
-        let resp = self
-            .github_aware_get(&url)
+        let bytes = self
+            .github_aware_bytes(&url)
             .await
             .with_context(|| format!("failed to fetch blog markdown from {}", url))?;
-        let text = resp.text().await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
 
         // Replace naked raw.githubusercontent.com URLs
         let raw_re = Regex::new(
@@ -1036,7 +1058,9 @@ impl OfficialV2Provider {
         .unwrap();
         let text = raw_re.replace_all(&text, |caps: &regex::Captures<'_>| {
             let matched = caps.get(0).unwrap().as_str();
-            cdn.convert_url(matched)
+            // 博客正文里的图片/链接按「图片地址」改写（GitCode 镜像下走 raw.gitcode.com
+            // 直出，而非 API 的 base64 JSON）。
+            cdn.convert_asset_url(matched)
         });
 
         // Resolve relative paths in markdown links/images
@@ -1064,7 +1088,7 @@ impl OfficialV2Provider {
                 format!("{}({})", prefix, link)
             } else {
                 let resolved = format!("{}{}", base_raw, link.trim_start_matches('/'));
-                format!("{}({})", prefix, cdn.convert_url(&resolved))
+                format!("{}({})", prefix, cdn.convert_asset_url(&resolved))
             }
         });
 
@@ -1178,18 +1202,35 @@ impl OfficialV2Provider {
     async fn refresh_inner(&self, cfg: &str) -> anyhow::Result<()> {
         // 更新cdn
         let cfg: HashMap<String, _> = serde_json::from_str(cfg).unwrap_or(HashMap::new());
-        let cdn: GitHubCdn = *cfg.get("cdn").unwrap_or(&GitHubCdn::Raw);
+        let mut cdn: GitHubCdn = *cfg.get("cdn").unwrap_or(&GitHubCdn::Raw);
+        // 后端兜底：source-cdn 型 pro 镜像（AstroBoxProMirror /
+        // AstroBoxProMirrorWaterFlames）已在产品侧停用，前端仅开通前缀代理型
+        // AboxMirror（uses_astrobox_source_cdn = false）。即使前端被绕过/残留
+        // 值直通此处，也强制落回 Raw，绝不激活停用的 source-cdn 管线。
+        if cdn.uses_astrobox_source_cdn() {
+            log::warn!(
+                "cdn `{}` is disabled; falling back to Raw",
+                cdn.id()
+            );
+            cdn = GitHubCdn::Raw;
+        }
+        // 运行时前提兜底：AboxMirror 需要已登录 AstroBox 账号（前端还有 Pro
+        // 档位判定，此处只兜「未登录」——覆盖 local_api HTTP 直通 /
+        // device/update.rs 直读 localStorage 等绕过前端 sanitize 的旁路）。
+        // 会员过期但仍在登录态属于前端守卫职责（后端无 VIP 档位体系）。
+        if cdn == GitHubCdn::AboxMirror && self.current_astrobox_token().await.is_err() {
+            log::warn!(
+                "cdn `AboxMirror` requires a logged-in AstroBox account; falling back to Raw"
+            );
+            cdn = GitHubCdn::Raw;
+        }
         self.cdn.store(Arc::new(cdn));
         // 更新index
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
-        let resp = self
-            .github_aware_get(&url)
+        let raw = self
+            .github_aware_bytes(&url)
             .await
             .with_context(|| format!("failed to request index_v2.csv from {url}"))?;
-        let raw = resp
-            .bytes()
-            .await
-            .context("failed to read index_v2.csv body")?;
 
         let sanitized = strip_zero_width(&String::from_utf8_lossy(&raw));
         let mut list: Vec<IndexV2> = Vec::new();
@@ -1223,26 +1264,21 @@ impl OfficialV2Provider {
 
         // 更新设备map
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
-        let resp = self
-            .github_aware_get(&url)
+        let bytes = self
+            .github_aware_bytes(&url)
             .await
             .with_context(|| format!("failed to request devices_v2.json from {url}"))?;
-        let map: DeviceMapV2 = resp
-            .json()
-            .await
+        let map: DeviceMapV2 = serde_json::from_slice(&bytes)
             .context("failed to parse devices_v2.json")?;
         self.device_map.store(Arc::new(map));
 
         // 更新探索页
         let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2p1.jsonc");
-        let resp = self
-            .github_aware_get(&url)
+        let bytes = self
+            .github_aware_bytes(&url)
             .await
             .with_context(|| format!("failed to request explore_v2p1.jsonc from {url}"))?;
-        let text = resp
-            .text()
-            .await
-            .context("failed to read explore_v2p1.jsonc body")?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         let mut explore: serde_json::Value = parse_jsonc(&text)
             .with_context(|| format!("failed to parse explore_v2p1.jsonc from {url}"))?;
         self.normalize_explore_v2p1_payload(&mut explore)
