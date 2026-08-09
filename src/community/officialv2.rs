@@ -25,6 +25,8 @@ use arc_swap::ArcSwap;
 use base64::Engine as _;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use ib_pinyin::{matcher::PinyinMatcher, pinyin::PinyinNotation};
+use memchr::memmem::Finder;
 use rand::seq::SliceRandom;
 use regex::Regex;
 use reqwest::StatusCode;
@@ -1371,11 +1373,51 @@ impl CommunityProvider for OfficialV2Provider {
         }
 
         if let Some(keyword) = &search.filter {
-            let keyword_lower = keyword.to_lowercase();
-            filtered_index.retain(|item| {
-                item.name.to_lowercase().contains(&keyword_lower)
-                    || item.tags.iter().any(|tag| tag.to_lowercase().contains(&keyword_lower))
-            });
+            if !keyword.is_empty() {
+                let keyword_lower = keyword.to_ascii_lowercase();
+                // memchr: 预编译 needle，循环内零分配子串搜索
+                let keyword_finder = Finder::new(keyword_lower.as_bytes());
+                // ib-pinyin: 预编译拼音匹配器（简拼 + 全拼），支持中文名称/标签
+                // 注意：query 必须小写化——大写字母只匹配字母、不匹配拼音（如 Muyu 匹配不上 木鱼）
+                let pinyin_matcher = PinyinMatcher::builder(keyword_lower.as_str())
+                    .pinyin_notations(PinyinNotation::Ascii | PinyinNotation::AsciiFirstLetter)
+                    .build();
+
+                filtered_index.retain(|item| {
+                    // id 只做完全匹配（忽略大小写）
+                    if item.id.eq_ignore_ascii_case(keyword.as_str()) {
+                        return true;
+                    }
+                    // 快速路径：原始文本 memchr 子串匹配（零分配）
+                    if keyword_finder.find(item.name.as_bytes()).is_some()
+                        || keyword_finder.find(item.repo_owner.as_bytes()).is_some()
+                        || item
+                            .tags
+                            .iter()
+                            .any(|t| keyword_finder.find(t.as_bytes()).is_some())
+                    {
+                        return true;
+                    }
+                    // 大小写不敏感路径：小写化后再匹配
+                    if keyword_finder
+                        .find(item.name.to_ascii_lowercase().as_bytes())
+                        .is_some()
+                        || keyword_finder
+                            .find(item.repo_owner.to_ascii_lowercase().as_bytes())
+                            .is_some()
+                        || item.tags.iter().any(|t| {
+                            keyword_finder
+                                .find(t.to_ascii_lowercase().as_bytes())
+                                .is_some()
+                        })
+                    {
+                        return true;
+                    }
+                    // 拼音匹配路径：中文名称/标签支持简拼与全拼搜索
+                    pinyin_matcher.is_match(&item.name)
+                        || item.tags.iter().any(|t| pinyin_matcher.is_match(t))
+                });
+            }
         }
 
         // 对过滤后的结果进行排序
@@ -1944,5 +1986,30 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].raw_url, "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/hero/a.png");
         assert_eq!(refs[1].raw_url, "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/authors/b.png");
+    }
+
+    #[test]
+    fn pinyin_matcher_matches_chinese_names() {
+        use ib_pinyin::{matcher::PinyinMatcher, pinyin::PinyinNotation};
+        fn build(q: &str) -> PinyinMatcher<'_> {
+            PinyinMatcher::builder(q)
+                .pinyin_notations(PinyinNotation::Ascii | PinyinNotation::AsciiFirstLetter)
+                .build()
+        }
+        // 全拼
+        assert!(build("muyu").is_match("木鱼Pro"));
+        // 简拼
+        assert!(build("my").is_match("木鱼Pro"));
+        // 中英混合（全拼 + 字母）
+        assert!(build("muyupro").is_match("木鱼Pro"));
+        // 无关拼音不匹配
+        assert!(!build("muma").is_match("木鱼Pro"));
+        // 大小写混合/大写 query（如输入法自动大写）必须先小写化才能命中拼音
+        for raw in ["Muyu", "MUYU", "MuyuPro"] {
+            let query = raw.to_ascii_lowercase();
+            assert!(build(&query).is_match("木鱼Pro"), "raw query: {raw}");
+        }
+        // 中文 query 不误伤纯英文资源名
+        assert!(!build("木鱼").is_match("MiBand 8"));
     }
 }
