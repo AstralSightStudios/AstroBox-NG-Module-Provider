@@ -1384,8 +1384,12 @@ impl CommunityProvider for OfficialV2Provider {
                     .build();
 
                 filtered_index.retain(|item| {
-                    // id 只做完全匹配（忽略大小写）
-                    if item.id.eq_ignore_ascii_case(keyword.as_str()) {
+                    // id 前缀匹配（忽略大小写）：如输入 com.searchstars 可搜到 com.searchstars.hyperbilibili
+                    if item
+                        .id
+                        .get(..keyword.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword.as_str()))
+                    {
                         return true;
                     }
                     // 快速路径：原始文本 memchr 子串匹配（零分配）
@@ -2011,5 +2015,21 @@ mod tests {
         }
         // 中文 query 不误伤纯英文资源名
         assert!(!build("木鱼").is_match("MiBand 8"));
+    }
+
+    #[test]
+    fn id_prefix_matching_semantics() {
+        // 与 get_page 一致的 id 前缀匹配逻辑（忽略大小写、UTF-8 安全切片）
+        let matches = |id: &str, kw: &str| {
+            id.get(..kw.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(kw))
+        };
+        assert!(matches("com.searchstars.hyperbilibili", "com.searchstars"));
+        assert!(matches("COM.SearchStars.HyperBiliBili", "com.searchstars"));
+        assert!(matches("LegacyItem1", "legacy"));
+        assert!(!matches("com.a.b", "com.searchstars"));
+        assert!(!matches("abc", "abcd"));
+        // 中文字节安全：不会因切片落在字符中间而 panic
+        assert!(!matches("abc", "木鱼"));
     }
 }
