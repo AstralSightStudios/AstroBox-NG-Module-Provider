@@ -97,6 +97,8 @@ pub enum ResourceTypeV2 {
     QuickApp, // 快应用
     #[serde(rename = "watchface")]
     WatchFace, // 表盘
+    #[serde(rename = "canopus")]
+    Canopus, // 模块
     #[serde(rename = "firmware")]
     Firmware, // 固件
     #[serde(rename = "fontpack")]
