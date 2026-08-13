@@ -41,6 +41,7 @@ const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
 const HIDE_FORCE_PAID: &str = "hide_force_paid"; // 隐藏强制付费
 const QUICK_APP: &str = "quick_app"; // 快应用
 const WATCHFACE: &str = "watchface"; // 表盘
+const CANOPUS: &str = "canopus"; // 模块
 const ACCOUNT_SOURCE_STORAGE_KEY: &str = "network_account_source_cfg";
 const ASTROBOX_ACCOUNT_PROVIDER: &str = "astrobox";
 
@@ -1334,8 +1335,19 @@ impl CommunityProvider for OfficialV2Provider {
         if let Some(categories) = &search.category {
             let hide_paid = categories.contains(&HIDE_PAID.to_string());
             let hide_force_paid = categories.contains(&HIDE_FORCE_PAID.to_string());
-            let quick_app = categories.contains(&QUICK_APP.to_string());
-            let watchface = categories.contains(&WATCHFACE.to_string());
+            let selected_resource_types = [
+                (QUICK_APP, ResourceTypeV2::QuickApp),
+                (WATCHFACE, ResourceTypeV2::WatchFace),
+                (CANOPUS, ResourceTypeV2::Canopus),
+            ]
+            .into_iter()
+            .filter_map(|(category, resource_type)| {
+                categories
+                    .iter()
+                    .any(|selected| selected == category)
+                    .then_some(resource_type)
+            })
+            .collect::<Vec<_>>();
             let mut devices = Vec::new();
 
             self.device_map()
@@ -1346,16 +1358,6 @@ impl CommunityProvider for OfficialV2Provider {
                     devices.push(e.id.clone());
                 });
 
-            let res_type = if quick_app && watchface {
-                None
-            } else if quick_app {
-                Some(ResourceTypeV2::QuickApp)
-            } else if watchface {
-                Some(ResourceTypeV2::WatchFace)
-            } else {
-                None
-            };
-
             filtered_index.retain(|item| {
                 (item
                     .devices
@@ -1364,11 +1366,8 @@ impl CommunityProvider for OfficialV2Provider {
                     || devices.is_empty())
                     && !(item.paid_type == PaidTypeV2::ForcePaid && hide_force_paid)
                     && !(item.paid_type == PaidTypeV2::Paid && hide_paid)
-                    && (if let Some(t) = &res_type {
-                        &item.restype == t
-                    } else {
-                        true
-                    })
+                    && (selected_resource_types.is_empty()
+                        || selected_resource_types.contains(&item.restype))
             });
         }
 
@@ -1519,6 +1518,7 @@ impl CommunityProvider for OfficialV2Provider {
             HIDE_FORCE_PAID.to_string(),
             QUICK_APP.to_string(),
             WATCHFACE.to_string(),
+            CANOPUS.to_string(),
         ];
 
         let device_map = self.device_map.load();
