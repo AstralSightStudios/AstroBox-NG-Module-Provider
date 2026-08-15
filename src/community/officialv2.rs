@@ -1202,6 +1202,18 @@ impl OfficialV2Provider {
         Ok(entry)
     }
 
+    /// Resolve the display icon URL for an item by id (or name), if it exists
+    /// in the in-memory index. Pure in-memory lookup, no network I/O.
+    pub fn resolve_item_icon(&self, item_id: &str) -> Option<String> {
+        let index = self.index.load();
+        let item = index
+            .iter()
+            .find(|entry| entry.id == item_id)
+            .or_else(|| index.iter().find(|entry| entry.name == item_id))?;
+        let base = self.build_repo_asset_url_by_index_item(item);
+        Some(self.resolve_repo_asset_url(&base, &item.icon))
+    }
+
     async fn refresh_inner(&self, cfg: &str) -> anyhow::Result<()> {
         // 更新cdn
         let cfg: HashMap<String, _> = serde_json::from_str(cfg).unwrap_or(HashMap::new());
