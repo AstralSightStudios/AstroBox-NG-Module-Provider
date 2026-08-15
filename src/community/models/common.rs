@@ -35,7 +35,49 @@ pub struct ManifestV2 {
     pub item: ManifestItemV2,
     pub links: Vec<ManifestLinkV2>,
     pub downloads: HashMap<String, ManifestDownloadV2>,
+    /// Provider-specific extensions. `bundledResources` is parsed by
+    /// [`ManifestV2::bundled_resources`]; retaining the raw value keeps all
+    /// existing and future extension fields forward-compatible.
     pub ext: serde_json::Value,
+}
+
+impl ManifestV2 {
+    pub fn bundled_resources(&self) -> Option<ManifestBundledResourcesV2> {
+        self.ext
+            .get("bundledResources")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+}
+
+/// Optional `manifest_v2.json` extension at `ext.bundledResources`.
+///
+/// Resource entries refer to any resource ID exposed by a community provider;
+/// plugin entries refer to a plugin marketplace manifest name. A resource entry
+/// without `provider` inherits the provider of the declaring manifest.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestBundledResourcesV2 {
+    #[serde(default)]
+    pub required: Vec<ManifestBundledResourceV2>,
+    #[serde(default)]
+    pub recommended: Vec<ManifestBundledResourceV2>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManifestBundledResourceV2 {
+    #[serde(rename = "type")]
+    pub resource_type: ManifestBundledResourceTypeV2,
+    pub id: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestBundledResourceTypeV2 {
+    Resource,
+    Plugin,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -115,4 +157,53 @@ pub enum PaidTypeV2 {
     Paid, // 付费（内含付费内容）
     #[serde(rename = "force_paid")]
     ForcePaid, // 强制付费（不给钱不让用）
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bundled_resources_extension_without_consuming_other_extensions() {
+        let manifest: ManifestV2 = serde_json::from_value(serde_json::json!({
+            "item": {
+                "id": "main-resource",
+                "restype": "watchface",
+                "name": "Main resource",
+                "description": "",
+                "preview": [],
+                "icon": "",
+                "cover": "",
+                "author": []
+            },
+            "links": [],
+            "downloads": {},
+            "ext": {
+                "bundledResources": {
+                    "required": [
+                        { "type": "resource", "id": "base-module" }
+                    ],
+                    "recommended": [
+                        {
+                            "type": "plugin",
+                            "id": "watchface-tools",
+                            "provider": "ignored-for-plugins"
+                        }
+                    ]
+                },
+                "anotherFutureExtension": true
+            }
+        }))
+        .expect("manifest should deserialize");
+
+        let bundled = manifest.bundled_resources().expect("bundle should parse");
+        assert_eq!(bundled.required.len(), 1);
+        assert_eq!(bundled.required[0].id, "base-module");
+        assert_eq!(bundled.recommended.len(), 1);
+        assert_eq!(
+            bundled.recommended[0].resource_type,
+            ManifestBundledResourceTypeV2::Plugin
+        );
+        assert!(manifest.ext.get("anotherFutureExtension").is_some());
+    }
 }
