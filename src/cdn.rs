@@ -71,12 +71,13 @@ pub enum GitHubCdn {
 }
 
 impl GitHubCdn {
-    /// 社区可选 CDN（含中国大陆赞助镜像，用于测速；赞助项是否展示由前端控制）。
-    pub const ALL: [Self; 11] = [
+    /// 社区可选 CDN（用于测速 / 自动切换）。pro 镜像（AstroBoxProMirror /
+    /// AstroBoxProMirrorWaterFlames / AboxMirror）已全部停用，不在列表中。
+    /// Xuanwu / Jieyuan 仍保留可手动选择，但被排除在自动测速与自动选择最佳线路之外
+    /// （前端 AUTO_SELECTION_EXCLUDED_OFFICIAL_CDNS + 后端 network_run_speed_test 跳过）。
+    pub const ALL: [Self; 9] = [
         GitHubCdn::Raw,
         GitHubCdn::GitHubDoh,
-        GitHubCdn::AstroBoxProMirrorWaterFlames,
-        GitHubCdn::AboxMirror,
         GitHubCdn::GhFast,
         GitHubCdn::GhProxy,
         GitHubCdn::GhProxyOrg,
