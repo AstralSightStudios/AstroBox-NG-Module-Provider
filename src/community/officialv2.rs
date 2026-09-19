@@ -2,7 +2,10 @@ use std::{
     cmp,
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -29,12 +32,13 @@ use ib_pinyin::{matcher::PinyinMatcher, pinyin::PinyinNotation};
 use memchr::memmem::Finder;
 use rand::seq::SliceRandom;
 use regex::Regex;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
+    sync::Mutex as AsyncMutex,
 };
 
 const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
@@ -49,7 +53,19 @@ const ASTROBOX_ACCOUNT_PROVIDER: &str = "astrobox";
 const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024; // 单张内联上限，超过则回退原始 URL
 const IMAGE_B64_CACHE_CAP: usize = 1024; // 内存缓存条数上限；内容按 commit 寻址、不可变
 const IMAGE_INLINE_CONCURRENCY: usize = 12; // 单页内联的并发抓取数
-const GITHUB_TOKEN_CACHE_TTL: Duration = Duration::from_secs(300); // GitHub access_token 内存缓存有效期
+const GITHUB_TOKEN_RETRY_COOLDOWN: Duration = Duration::from_secs(600); // 取 GitHub token 暂时失败后的冷却时间
+const GITHUB_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10); // 取 GitHub token 的请求超时，避免单飞时久等
+
+// 当前 AstroBox 账号的 GitHub access_token 状态，整个应用生命周期内有效
+#[derive(Debug, Clone, PartialEq)]
+enum GithubTokenState {
+    // 拿到了 token，后续请求直接复用
+    Ready(String),
+    // 确定拿不到（未绑定 / 401 / 403 / GitHub 判定 token 失效），本次生命周期不再请求
+    Unavailable,
+    // 暂时失败（网络错误 / 5xx / 429），冷却到该时刻前直接走 raw
+    CoolingDown(Instant),
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -383,10 +399,11 @@ pub struct OfficialV2Provider {
     placeholder_index: ArcSwap<u32>,
     // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
     image_b64_cache: Mutex<HashMap<String, Arc<str>>>,
-    // 已登录用户在 Raw CDN 下改走 GitHub API 时的 access_token 内存缓存。
-    // 三元组：(AstroBox token 标识, GitHub access_token, 获取时间)。
-    // 用 AstroBox token 作键，防止同一应用实例切换账号后复用旧用户的 GitHub token。
-    github_token_cache: Mutex<Option<(String, String, Instant)>>,
+    // Raw CDN 在本次生命周期内是否撞过 GitHub 限流；撞过之后有 token 就直接走 API
+    raw_rate_limited: AtomicBool,
+    // (AstroBox token, GitHub token 状态)。用 AstroBox token 作键，切换账号后重新判断；
+    // 异步锁在取 token 期间一直持有，并发请求只会发出一次 /auth/api/github-token。
+    github_token_state: AsyncMutex<Option<(String, GithubTokenState)>>,
 }
 
 impl OfficialV2Provider {
@@ -402,7 +419,8 @@ impl OfficialV2Provider {
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             placeholder_index: ArcSwap::new(Arc::new(0)),
             image_b64_cache: Mutex::new(HashMap::new()),
-            github_token_cache: Mutex::new(None),
+            raw_rate_limited: AtomicBool::new(false),
+            github_token_state: AsyncMutex::new(None),
         }
     }
 
@@ -627,50 +645,85 @@ impl OfficialV2Provider {
             .ok_or_else(|| anyhow!("请先登录 AstroBox 账号"))
     }
 
-    async fn current_github_token(&self) -> anyhow::Result<Option<String>> {
-        // 仅 Raw CDN 下才需要 GitHub API token
-        if *self.cdn.load_full() != GitHubCdn::Raw {
-            return Ok(None);
-        }
-
-        let astrobox_token = match self.current_astrobox_token().await {
-            Ok(token) => token,
+    // 取当前账号的 GitHub access_token。只在 Raw CDN 真的撞了限流之后才会走到这里。
+    // 未登录、或本地账号资料显示没绑定 GitHub 时直接返回 None，不发请求；
+    // 结果按 AstroBox token 缓存整个应用生命周期，锁跨 await 持有实现单飞。
+    async fn current_github_token(&self) -> Option<String> {
+        let account = match AccountStore::new(ASTROBOX_ACCOUNT_PROVIDER)
+            .load(&self.app_handle)
+            .await
+        {
+            Ok(Some(account)) => account,
+            Ok(None) => return None,
             Err(err) => {
-                log::debug!("[OfficialV2] skip github token: astrobox not logged in: {err}");
-                return Ok(None);
+                log::debug!("[OfficialV2] skip github token: failed to read AstroBox account: {err}");
+                return None;
             }
         };
+        let astrobox_token = account
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())?
+            .to_string();
 
+        // getUserInfo 同步下来的 github 字段为空即未绑定；字段缺失时无法判断，交给接口确认
+        if account
+            .extra_as::<String>("github")
+            .is_some_and(|github| github.trim().is_empty())
         {
-            if let Ok(cache) = self.github_token_cache.lock() {
-                if let Some((key, token, fetched_at)) = cache.as_ref() {
-                    if key == &astrobox_token && fetched_at.elapsed() <= GITHUB_TOKEN_CACHE_TTL {
-                        return Ok(Some(token.clone()));
+            return None;
+        }
+
+        let mut state = self.github_token_state.lock().await;
+        if let Some((key, cached)) = state.as_ref() {
+            if key == &astrobox_token {
+                match cached {
+                    GithubTokenState::Ready(token) => return Some(token.clone()),
+                    GithubTokenState::Unavailable => return None,
+                    GithubTokenState::CoolingDown(until) if Instant::now() < *until => {
+                        return None;
                     }
+                    GithubTokenState::CoolingDown(_) => {}
                 }
             }
         }
 
+        let fetched = self.fetch_github_token(&astrobox_token).await;
+        let token = match &fetched {
+            GithubTokenState::Ready(token) => Some(token.clone()),
+            _ => None,
+        };
+        *state = Some((astrobox_token, fetched));
+        token
+    }
+
+    async fn fetch_github_token(&self, astrobox_token: &str) -> GithubTokenState {
+        let cool_down = || GithubTokenState::CoolingDown(Instant::now() + GITHUB_TOKEN_RETRY_COOLDOWN);
+
         let base_url = self.current_account_source().await.astrobox_api_base_url();
         let response = match crate::net::default_client()
             .get(format!("{base_url}/auth/api/github-token"))
-            .header("X-ASTROBOX-TOKEN", &astrobox_token)
+            .header("X-ASTROBOX-TOKEN", astrobox_token)
+            .timeout(GITHUB_TOKEN_REQUEST_TIMEOUT)
             .send()
             .await
         {
             Ok(resp) => resp,
             Err(err) => {
                 log::warn!("[OfficialV2] github token request network error: {err}");
-                return Ok(None);
+                return cool_down();
             }
         };
 
         let status = response.status();
         if !status.is_success() {
-            log::warn!(
-                "[OfficialV2] github token request failed: {status}"
-            );
-            return Ok(None);
+            log::warn!("[OfficialV2] github token request failed: {status}");
+            return if github_token_failure_is_transient(status) {
+                cool_down()
+            } else {
+                GithubTokenState::Unavailable
+            };
         }
 
         #[derive(Debug, Deserialize)]
@@ -683,18 +736,25 @@ impl OfficialV2Provider {
             Ok(p) => p,
             Err(err) => {
                 log::warn!("[OfficialV2] failed to parse github token response: {err}");
-                return Ok(None);
+                return cool_down();
             }
         };
-        let token = payload.access_token.trim().to_string();
+        let token = payload.access_token.trim();
         if token.is_empty() || token == "***" {
-            return Ok(None);
+            log::info!("[OfficialV2] no GitHub token bound; keep using raw");
+            return GithubTokenState::Unavailable;
         }
+        GithubTokenState::Ready(token.to_string())
+    }
 
-        if let Ok(mut cache) = self.github_token_cache.lock() {
-            *cache = Some((astrobox_token, token.clone(), Instant::now()));
+    // GitHub 拒绝了缓存的 token（401），本次生命周期内不再使用
+    async fn invalidate_github_token(&self, token: &str) {
+        let mut state = self.github_token_state.lock().await;
+        if let Some((_, cached)) = state.as_mut() {
+            if matches!(cached, GithubTokenState::Ready(t) if t == token) {
+                *cached = GithubTokenState::Unavailable;
+            }
         }
-        Ok(Some(token))
     }
 
     // 把 raw.githubusercontent.com 地址改写成 GitHub Contents API 地址，
@@ -735,25 +795,13 @@ impl OfficialV2Provider {
         ))
     }
 
-    // 在 Raw CDN + 已登录且 Casdoor 存了 GitHub access_token 时，
-    // 改走 GitHub API（5000/h）以避免 raw.githubusercontent.com 的 429。
-    // 条件不满足或任何失败都返回 None，由调用方回退普通 raw 请求。
-    async fn try_fetch_via_github_api(
-        &self,
-        url: &str,
-    ) -> anyhow::Result<Option<reqwest::Response>> {
-        if *self.cdn.load_full() != GitHubCdn::Raw {
-            return Ok(None);
-        }
-        let Some(token) = self.current_github_token().await? else {
-            return Ok(None);
-        };
-        let Some(api_url) = Self::raw_url_to_github_api(url) else {
-            return Ok(None);
-        };
+    // 用缓存的 GitHub token 走 Contents API（5000/h）绕开 raw 限流。
+    // 拿不到 token 或任何失败都返回 None，由调用方回退普通 raw 请求。
+    async fn fetch_via_github_api(&self, api_url: &str) -> Option<reqwest::Response> {
+        let token = self.current_github_token().await?;
 
         let response = match crate::net::default_client()
-            .get(&api_url)
+            .get(api_url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/vnd.github.raw")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -765,31 +813,64 @@ impl OfficialV2Provider {
                 log::warn!(
                     "[OfficialV2] GitHub API request failed for {api_url}: {err}; fallback to raw"
                 );
-                return Ok(None);
+                return None;
             }
         };
 
         let status = response.status();
         if status.is_success() {
-            return Ok(Some(response));
+            return Some(response);
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            log::warn!("[OfficialV2] GitHub rejected cached token (401); disable it for this session");
+            self.invalidate_github_token(&token).await;
+        } else {
+            log::warn!(
+                "[OfficialV2] GitHub API returned {status} for {api_url}; fallback to raw"
+            );
+        }
+        None
+    }
+
+    // 统一的 raw 拉取入口，返回未经 error_for_status 的响应，状态码由调用方处理。
+    // 平时直接请求原 URL，不做任何前置请求；只有 Raw CDN 下真的撞了 GitHub 限流，
+    // 才去取 GitHub token 改走 API，并记住“已被限流”，之后有 token 就直接走 API。
+    async fn github_aware_send(&self, url: &str) -> anyhow::Result<reqwest::Response> {
+        let api_url = if *self.cdn.load_full() == GitHubCdn::Raw {
+            Self::raw_url_to_github_api(url)
+        } else {
+            None
+        };
+        let rate_limited = self.raw_rate_limited.load(Ordering::Relaxed);
+
+        if rate_limited {
+            if let Some(api_url) = api_url.as_deref() {
+                if let Some(response) = self.fetch_via_github_api(api_url).await {
+                    return Ok(response);
+                }
+            }
+        }
+
+        let response = crate::net::default_client().get(url).send().await?;
+        let Some(api_url) = api_url else {
+            return Ok(response);
+        };
+        if rate_limited || !is_github_rate_limited(response.status(), response.headers()) {
+            return Ok(response);
         }
 
         log::warn!(
-            "[OfficialV2] GitHub API returned {status} for {api_url}; fallback to raw"
+            "[OfficialV2] raw request rate limited ({}) for {url}; prefer GitHub API from now on",
+            response.status()
         );
-        Ok(None)
+        self.raw_rate_limited.store(true, Ordering::Relaxed);
+        Ok(self.fetch_via_github_api(&api_url).await.unwrap_or(response))
     }
 
-    // 统一 GET 入口：优先尝试 GitHub API（Raw+登录+有 token），失败或条件不满足则走原 URL。
+    // 统一 GET 入口：同 github_aware_send，但非 2xx 直接报错。
     async fn github_aware_get(&self, url: &str) -> anyhow::Result<reqwest::Response> {
-        if let Some(response) = self.try_fetch_via_github_api(url).await? {
-            return Ok(response);
-        }
-        Ok(crate::net::default_client()
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?)
+        Ok(self.github_aware_send(url).await?.error_for_status()?)
     }
 
     // 统一 GET 并把响应体读成字节；对 GitCode API（Xuanwu/Jieyuan 数据文件）返回的
@@ -1105,22 +1186,16 @@ impl OfficialV2Provider {
         commit_hash: &str,
     ) -> anyhow::Result<ManifestV2> {
         let base = self.build_repo_cdn_url(owner, name, commit_hash);
-        let client = crate::net::default_client();
 
         let url_v2 = format!("{}/manifest_v2.json", base);
-        let resp_v2 = match self.try_fetch_via_github_api(&url_v2).await? {
-            Some(resp) => resp,
-            None => client.get(&url_v2).send().await?,
-        };
+        let resp_v2 = self.github_aware_send(&url_v2).await?;
 
         if resp_v2.status() == reqwest::StatusCode::NOT_FOUND {
             // fallback v1 manifest
             let url_v1 = format!("{}/manifest.json", base);
-            let resp_v1 = match self.try_fetch_via_github_api(&url_v1).await? {
-                Some(resp) => resp,
-                None => client.get(&url_v1).send().await?,
-            };
-            let resp_v1 = resp_v1
+            let resp_v1 = self
+                .github_aware_send(&url_v1)
+                .await?
                 .error_for_status()
                 .with_context(|| format!("failed to request legacy manifest `{url_v1}`"))?;
 
@@ -1706,19 +1781,12 @@ impl CommunityProvider for OfficialV2Provider {
             .unwrap_or_default()
             .as_nanos();
         let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, safe_file_name));
-        let client = crate::net::default_client();
-        let response = match self.try_fetch_via_github_api(&resolved_url).await? {
-            Some(resp) => resp,
-            None => client
-                .get(&resolved_url)
-                .send()
-                .await
-                .with_context(|| format!("failed to request {}", resolved_url))?
-                .error_for_status()
-                .with_context(|| {
-                    format!("download request returned error for {}", resolved_url)
-                })?,
-        };
+        let response = self
+            .github_aware_send(&resolved_url)
+            .await
+            .with_context(|| format!("failed to request {}", resolved_url))?
+            .error_for_status()
+            .with_context(|| format!("download request returned error for {}", resolved_url))?;
 
         let cleanup_path = tmp_path.clone();
         let download_result = {
@@ -1831,6 +1899,30 @@ impl CommunityProvider for OfficialV2Provider {
     }
 }
 
+// raw.githubusercontent.com 限流时返回 429；GitHub 也会用 403 加限流头表示限流
+// （x-ratelimit-remaining: 0 或带 retry-after）。普通的 403 / 404 不算限流。
+fn is_github_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    let remaining_exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0");
+    remaining_exhausted || headers.contains_key(reqwest::header::RETRY_AFTER)
+}
+
+// 取 GitHub token 失败时是否属于暂时性错误（冷却后可重试）。
+// 429 包括服务端 nginx 对该接口的限流；401 / 403 等其余 4xx 视为确定结果。
+fn github_token_failure_is_transient(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
 fn strip_zero_width(input: &str) -> String {
     input
         .chars()
@@ -1909,6 +2001,46 @@ mod tests {
             ),
             Some("https://api.github.com/repos/owner/repo/contents/xxx/file.json?ref=refs%2Fheads%2Ffeature".to_string())
         );
+    }
+
+    #[test]
+    fn github_rate_limit_detects_429() {
+        assert!(is_github_rate_limited(
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn github_rate_limit_detects_403_with_ratelimit_headers() {
+        let mut exhausted = HeaderMap::new();
+        exhausted.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        assert!(is_github_rate_limited(StatusCode::FORBIDDEN, &exhausted));
+
+        let mut retry_after = HeaderMap::new();
+        retry_after.insert(reqwest::header::RETRY_AFTER, "60".parse().unwrap());
+        assert!(is_github_rate_limited(StatusCode::FORBIDDEN, &retry_after));
+    }
+
+    #[test]
+    fn github_rate_limit_ignores_plain_errors() {
+        let mut remaining = HeaderMap::new();
+        remaining.insert("x-ratelimit-remaining", "42".parse().unwrap());
+        assert!(!is_github_rate_limited(StatusCode::FORBIDDEN, &remaining));
+        assert!(!is_github_rate_limited(StatusCode::FORBIDDEN, &HeaderMap::new()));
+        assert!(!is_github_rate_limited(StatusCode::NOT_FOUND, &HeaderMap::new()));
+        assert!(!is_github_rate_limited(StatusCode::OK, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn github_token_failure_transient_classification() {
+        assert!(github_token_failure_is_transient(StatusCode::TOO_MANY_REQUESTS));
+        assert!(github_token_failure_is_transient(StatusCode::BAD_GATEWAY));
+        assert!(github_token_failure_is_transient(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(github_token_failure_is_transient(StatusCode::REQUEST_TIMEOUT));
+        assert!(!github_token_failure_is_transient(StatusCode::UNAUTHORIZED));
+        assert!(!github_token_failure_is_transient(StatusCode::FORBIDDEN));
+        assert!(!github_token_failure_is_transient(StatusCode::NOT_FOUND));
     }
 
     #[test]
