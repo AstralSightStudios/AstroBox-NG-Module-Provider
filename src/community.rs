@@ -60,6 +60,20 @@ pub trait CommunityProvider: Send + Sync {
         device: String,
         progress_cb: Option<Box<dyn Fn(models::common::ProgressData) + Send>>,
     ) -> anyhow::Result<std::path::PathBuf>;
+    async fn download_with_cancel(
+        &self,
+        item_id: String,
+        device: String,
+        progress_cb: Option<Box<dyn Fn(models::common::ProgressData) + Send>>,
+        cancel: netcfg::download::CancellationToken,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("download_cancelled")),
+            result = self.download(item_id, device, progress_cb) => result,
+        }
+    }
+
     async fn get_total_items(&self) -> anyhow::Result<u64>;
 
     async fn probe_download_size(

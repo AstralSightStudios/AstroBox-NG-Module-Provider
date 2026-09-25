@@ -251,7 +251,7 @@ impl GitHubCdn {
 /// 判断 URL 是否为可经镜像加速的 GitHub 资源：
 /// `raw.githubusercontent.com`/`gist.githubusercontent.com` 原始文件，或 `github.com` 的
 /// release 下载与源码归档。
-fn is_convertible_github_url(url: &str) -> bool {
+pub(crate) fn is_convertible_github_url(url: &str) -> bool {
     if url.starts_with("https://raw.githubusercontent.com/")
         || url.starts_with("https://gist.githubusercontent.com/")
     {

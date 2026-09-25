@@ -1,12 +1,17 @@
+mod flight;
+mod network;
+
+use flight::Flights;
+use netcfg::download::{CancellationToken, DownloadManager, DownloadOptions, DownloadRequest};
+
 use std::{
-    cmp,
     collections::HashMap,
     path::PathBuf,
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -35,11 +40,7 @@ use regex::Regex;
 use reqwest::{StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
-use tokio::{
-    fs::{self, File},
-    io::AsyncWriteExt,
-    sync::Mutex as AsyncMutex,
-};
+use tokio::sync::Mutex as AsyncMutex;
 
 const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
 const HIDE_FORCE_PAID: &str = "hide_force_paid"; // 隐藏强制付费
@@ -387,16 +388,62 @@ fn collect_explore_v2p1_assets(value: &serde_json::Value, path: &mut Vec<PathSeg
     }
 }
 
+struct Catalog {
+    index: Arc<Vec<IndexV2>>,
+    device_map: Arc<DeviceMapV2>,
+}
+
+struct ExploreState {
+    value: Arc<serde_json::Value>,
+    error: Option<String>,
+}
+
+fn publish_refresh(
+    catalog: &ArcSwap<Catalog>,
+    explore_state: &ArcSwap<ExploreState>,
+    index: anyhow::Result<Vec<IndexV2>>,
+    devices: anyhow::Result<DeviceMapV2>,
+    explore: anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<()> {
+    match explore {
+        Ok(value) => explore_state.store(Arc::new(ExploreState {
+            value: Arc::new(value),
+            error: None,
+        })),
+        // 与目录一致：刷新失败不把本次运行中已加载的探索内容覆盖成错误。
+        Err(error) if explore_state.load().value.is_null() => {
+            explore_state.store(Arc::new(ExploreState {
+                value: Arc::new(serde_json::Value::Null),
+                error: Some(format!("{error:#}")),
+            }))
+        }
+        Err(error) => {
+            log::warn!("[OfficialV2] explore refresh failed, keeping loaded payload: {error:#}")
+        }
+    }
+    let next = Catalog {
+        index: Arc::new(index?),
+        device_map: Arc::new(devices?),
+    };
+    catalog.store(Arc::new(next));
+    Ok(())
+}
+
+pub fn validate_index_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+    network::parse_index(bytes).map(|_| ())
+}
+
 pub struct OfficialV2Provider {
     cdn: ArcSwap<GitHubCdn>,
     app_handle: AppHandle,
-    index: ArcSwap<Vec<IndexV2>>,
-    splited_index: ArcSwap<Vec<Vec<IndexV2>>>,
-    splited_limit: ArcSwap<usize>,
-    device_map: ArcSwap<DeviceMapV2>,
-    explore: ArcSwap<serde_json::Value>,
+    catalog: ArcSwap<Catalog>,
+    explore: ArcSwap<ExploreState>,
+    refresh_flights: Flights<()>,
+    refresh_lock: AsyncMutex<()>,
+    manifest_flights: Flights<ManifestV2>,
+    downloader: DownloadManager,
+    network: network::Network,
     state: ArcSwap<ProviderState>,
-    placeholder_index: ArcSwap<u32>,
     // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
     image_b64_cache: Mutex<HashMap<String, Arc<str>>>,
     // Raw CDN 在本次生命周期内是否撞过 GitHub 限流；撞过之后有 token 就直接走 API
@@ -411,13 +458,20 @@ impl OfficialV2Provider {
         Self {
             cdn: ArcSwap::new(Arc::new(cdn)),
             app_handle,
-            index: ArcSwap::new(Arc::new(Vec::new())),
-            splited_index: ArcSwap::new(Arc::new(Vec::new())),
-            splited_limit: ArcSwap::new(Arc::new(0)),
-            device_map: ArcSwap::new(Arc::new(DeviceMapV2::default())),
-            explore: ArcSwap::new(Arc::new(serde_json::Value::Null)),
+            catalog: ArcSwap::from_pointee(Catalog {
+                index: Arc::new(Vec::new()),
+                device_map: Arc::new(DeviceMapV2::default()),
+            }),
+            explore: ArcSwap::from_pointee(ExploreState {
+                value: Arc::new(serde_json::Value::Null),
+                error: None,
+            }),
+            refresh_flights: Flights::default(),
+            refresh_lock: AsyncMutex::new(()),
+            manifest_flights: Flights::default(),
+            downloader: DownloadManager::default(),
+            network: network::Network::default(),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
-            placeholder_index: ArcSwap::new(Arc::new(0)),
             image_b64_cache: Mutex::new(HashMap::new()),
             raw_rate_limited: AtomicBool::new(false),
             github_token_state: AsyncMutex::new(None),
@@ -438,7 +492,7 @@ impl OfficialV2Provider {
     }
 
     pub fn device_map(&self) -> Arc<DeviceMapV2> {
-        self.device_map.load().clone()
+        self.catalog.load().device_map.clone()
     }
 
     pub fn device_map_all(&self) -> Vec<DeviceV2> {
@@ -460,8 +514,12 @@ impl OfficialV2Provider {
         all
     }
 
-    pub fn explore(&self) -> Arc<serde_json::Value> {
-        self.explore.load().clone()
+    pub fn explore(&self) -> anyhow::Result<Arc<serde_json::Value>> {
+        let state = self.explore.load();
+        if let Some(error) = &state.error {
+            return Err(anyhow!("{error}"));
+        }
+        Ok(state.value.clone())
     }
 
     /// 把 explore_v2p1.jsonc 解析后的 payload 里所有图片 URL 按当前 CDN 改写。
@@ -536,7 +594,7 @@ impl OfficialV2Provider {
     }
 
     pub fn device_map_model_to_id(&self, model: &str) -> Option<String> {
-        let device_map = self.device_map.load();
+        let device_map = self.catalog.load().device_map.clone();
         if let Some(device) = device_map.xiaomi.get(model) {
             return Some(device.id.clone());
         }
@@ -544,29 +602,6 @@ impl OfficialV2Provider {
             return Some(device.id.clone());
         }
         None
-    }
-
-    fn split_index(&self, limit: usize, sort: SortRuleV2) {
-        let index = self.index.load().clone();
-        let mut rng = rand::rng();
-        let mut sorted_index = (*index).clone();
-
-        match sort {
-            SortRuleV2::Random => sorted_index.shuffle(&mut rng),
-            SortRuleV2::Name => {
-                sorted_index.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            SortRuleV2::Time => {
-                sorted_index.reverse();
-            }
-        };
-
-        let splited_index = sorted_index
-            .chunks(limit)
-            .map(|c| c.to_vec())
-            .collect::<Vec<_>>();
-        self.splited_index.store(Arc::new(splited_index));
-        self.splited_limit.store(Arc::new(limit));
     }
 
     pub fn build_repo_raw_url(&self, owner: &str, name: &str, commit_hash: &str) -> String {
@@ -836,8 +871,12 @@ impl OfficialV2Provider {
     // 统一的 raw 拉取入口，返回未经 error_for_status 的响应，状态码由调用方处理。
     // 平时直接请求原 URL，不做任何前置请求；只有 Raw CDN 下真的撞了 GitHub 限流，
     // 才去取 GitHub token 改走 API，并记住“已被限流”，之后有 token 就直接走 API。
-    async fn github_aware_send(&self, url: &str) -> anyhow::Result<reqwest::Response> {
-        let api_url = if *self.cdn.load_full() == GitHubCdn::Raw {
+    async fn github_aware_send(
+        &self,
+        url: &str,
+        cdn: GitHubCdn,
+    ) -> anyhow::Result<reqwest::Response> {
+        let api_url = if cdn == GitHubCdn::Raw {
             Self::raw_url_to_github_api(url)
         } else {
             None
@@ -852,7 +891,7 @@ impl OfficialV2Provider {
             }
         }
 
-        let response = crate::net::default_client().get(url).send().await?;
+        let response = self.network.client(cdn).get(url).send().await?;
         let Some(api_url) = api_url else {
             return Ok(response);
         };
@@ -866,33 +905,6 @@ impl OfficialV2Provider {
         );
         self.raw_rate_limited.store(true, Ordering::Relaxed);
         Ok(self.fetch_via_github_api(&api_url).await.unwrap_or(response))
-    }
-
-    // 统一 GET 入口：同 github_aware_send，但非 2xx 直接报错。
-    async fn github_aware_get(&self, url: &str) -> anyhow::Result<reqwest::Response> {
-        Ok(self.github_aware_send(url).await?.error_for_status()?)
-    }
-
-    // 统一 GET 并把响应体读成字节；对 GitCode API（Xuanwu/Jieyuan 数据文件）返回的
-    // base64 JSON 包装（{"type":"file","encoding":"base64","content":...}）自动解码回
-    // 原始字节。其余源（raw.githubusercontent.com / GitHub API / 前缀代理）响应为纯
-    // 内容，原样返回。type=="file" 判别用于排除任意 JSON 恰好含这两键的理论误伤。
-    async fn github_aware_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        let resp = self.github_aware_get(url).await?;
-        let bytes = resp.bytes().await?.to_vec();
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            if value.get("type").and_then(|t| t.as_str()) == Some("file")
-                && value.get("encoding").and_then(|e| e.as_str()) == Some("base64")
-            {
-                if let Some(content) = value.get("content").and_then(|c| c.as_str()) {
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(content)
-                    {
-                        return Ok(decoded);
-                    }
-                }
-            }
-        }
-        Ok(bytes)
     }
 
     async fn resolve_source_cdn_download_url(
@@ -1128,12 +1140,9 @@ impl OfficialV2Provider {
             "https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/blogs/{}",
             path
         );
-        let url = cdn.convert_url(&raw_url);
-        let bytes = self
-            .github_aware_bytes(&url)
-            .await
-            .with_context(|| format!("failed to fetch blog markdown from {}", url))?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = self
+            .fetch_metadata(&raw_url, cdn, network::parse_markdown)
+            .await?;
 
         // Replace naked raw.githubusercontent.com URLs
         let raw_re = Regex::new(
@@ -1185,36 +1194,27 @@ impl OfficialV2Provider {
         name: &str,
         commit_hash: &str,
     ) -> anyhow::Result<ManifestV2> {
-        let base = self.build_repo_cdn_url(owner, name, commit_hash);
-
-        let url_v2 = format!("{}/manifest_v2.json", base);
-        let resp_v2 = self.github_aware_send(&url_v2).await?;
-
-        if resp_v2.status() == reqwest::StatusCode::NOT_FOUND {
-            // fallback v1 manifest
-            let url_v1 = format!("{}/manifest.json", base);
-            let resp_v1 = self
-                .github_aware_send(&url_v1)
-                .await?
-                .error_for_status()
-                .with_context(|| format!("failed to request legacy manifest `{url_v1}`"))?;
-
-            let text_v1 = resp_v1.text().await?;
-            let raw_v1: serde_json::Value = serde_json::from_str(&text_v1)
-                .with_context(|| "failed to parse legacy manifest json")?;
-
-            let manifest_v2 = super::legacyparse::manifest_v1_to_v2(raw_v1)
-                .with_context(|| "failed to convert legacy manifest v1 -> v2")?;
-
-            Ok(manifest_v2)
-        } else {
-            let resp_v2 = resp_v2
-                .error_for_status()
-                .with_context(|| format!("failed to request manifest v2 `{url_v2}`"))?;
-            let text_v2 = resp_v2.text().await?;
-            let manifest: ManifestV2 = serde_json::from_str(&text_v2)?;
-            Ok(manifest)
-        }
+        let cdn = *self.cdn.load_full();
+        let base = self.build_repo_raw_url(owner, name, commit_hash);
+        self.manifest_flights
+            .run(format!("{}:{base}", cdn.id()), async {
+                let url_v2 = format!("{base}/manifest_v2.json");
+                match self
+                    .fetch_metadata(&url_v2, cdn, network::parse_manifest)
+                    .await
+                {
+                    Ok(manifest) => Ok(manifest),
+                    Err(error) if network::is_not_found(&error) => self
+                        .fetch_metadata(&format!("{base}/manifest.json"), cdn, |bytes| {
+                            let value = serde_json::from_slice(bytes)?;
+                            super::legacyparse::manifest_v1_to_v2(value)
+                        })
+                        .await
+                        .context("failed to fetch legacy manifest"),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
     }
 
     pub async fn resolve_download_entry(
@@ -1223,7 +1223,7 @@ impl OfficialV2Provider {
         device: String,
         trial: bool,
     ) -> anyhow::Result<ManifestDownloadV2> {
-        let index = self.index.load();
+        let index = self.catalog.load().index.clone();
         let index_ref = index.clone();
 
         let item = index_ref
@@ -1262,17 +1262,8 @@ impl OfficialV2Provider {
             entry.display_name = self.device_map_id_to_name(&device);
         }
 
-        let base = self.build_repo_cdn_url_by_index_item(&item);
-        let resolved_url = if let Some(url) = &entry.url {
-            self.resolve_repo_asset_url(&base, url)
-        } else {
-            format!(
-                "{}/{}",
-                base.trim_end_matches('/'),
-                entry.file_name.trim_start_matches('/')
-            )
-        };
-        entry.url = Some(resolved_url);
+        let raw_url = self.download_raw_url(&item, &entry);
+        entry.url = Some(self.cdn.load_full().convert_url(&raw_url));
 
         Ok(entry)
     }
@@ -1280,13 +1271,130 @@ impl OfficialV2Provider {
     /// Resolve the display icon URL for an item by id (or name), if it exists
     /// in the in-memory index. Pure in-memory lookup, no network I/O.
     pub fn resolve_item_icon(&self, item_id: &str) -> Option<String> {
-        let index = self.index.load();
+        let index = self.catalog.load().index.clone();
         let item = index
             .iter()
             .find(|entry| entry.id == item_id)
             .or_else(|| index.iter().find(|entry| entry.name == item_id))?;
         let base = self.build_repo_asset_url_by_index_item(item);
         Some(self.resolve_repo_asset_url(&base, &item.icon))
+    }
+
+    fn download_raw_url(&self, item: &IndexV2, entry: &ManifestDownloadV2) -> String {
+        let base =
+            self.build_repo_raw_url(&item.repo_owner, &item.repo_name, &item.repo_commit_hash);
+        let path = entry
+            .url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(&entry.file_name);
+        if path.starts_with("https://") || path.starts_with("http://") {
+            path.to_string()
+        } else {
+            format!("{}/{}", base, path.trim_start_matches('/'))
+        }
+    }
+
+    async fn download_resource(
+        &self,
+        item_id: String,
+        device: String,
+        progress_cb: Option<Box<dyn Fn(ProgressData) + Send>>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<PathBuf> {
+        let index = self.catalog.load().index.clone();
+        let index_ref = index.clone();
+
+        // 优先根据id查找，找不到再跟名称
+        // 这是为了兼容v1的manifest无id
+        let item = index_ref
+            .iter()
+            .find(|entry| entry.id == item_id)
+            .or_else(|| index_ref.iter().find(|entry| entry.name == item_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("Item not found by id or name"))?;
+
+        let manifest = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(anyhow!("download_cancelled")),
+            manifest = self.get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash) => manifest,
+        }.with_context(|| format!("failed to fetch manifest for {}", item.name))?;
+
+        let downloads = &manifest.downloads;
+        let (resolved_device, download_entry) = downloads
+            .get(&device)
+            .map(|entry| (device.as_str(), entry))
+            .or_else(|| downloads.get("default").map(|entry| ("default", entry)))
+            .or_else(|| {
+                downloads
+                    .iter()
+                    .next()
+                    .map(|(key, entry)| (key.as_str(), entry))
+            })
+            .map(|(key, entry)| (key.to_string(), entry.clone()))
+            .ok_or_else(|| anyhow!("no downloadable artifact for device `{device}`"))?;
+
+        let mut file_name = download_entry.file_name.trim().to_string();
+        if file_name.is_empty() {
+            if let Some(url) = &download_entry.url {
+                if let Ok(url) = reqwest::Url::parse(url) {
+                    if let Some(name) = url
+                        .path_segments()
+                        .and_then(|mut segments| segments.next_back())
+                    {
+                        file_name = name.to_string();
+                    }
+                }
+            }
+        }
+        if file_name.is_empty() {
+            return Err(anyhow!("download entry missing file name"));
+        }
+
+        let safe_file_name = sanitize_local_filename(&file_name);
+
+        let cdn = *self.cdn.load_full();
+        let raw_url = if cdn.uses_astrobox_source_cdn() {
+            self.resolve_source_cdn_download_url(&item.id, Some(&resolved_device))
+                .await?
+        } else {
+            self.download_raw_url(&item, &download_entry)
+        };
+
+        let root = self.cache_root()?;
+        let canonical_base =
+            self.build_repo_raw_url(&item.repo_owner, &item.repo_name, &item.repo_commit_hash);
+        let immutable = raw_url.starts_with(&format!("{canonical_base}/"))
+            && (7..=40).contains(&item.repo_commit_hash.len())
+            && item.repo_commit_hash.bytes().all(|b| b.is_ascii_hexdigit());
+        let request = DownloadRequest {
+            identity: format!(
+                "{}\0{}\0{}\0{}\0{}",
+                item.id, resolved_device, item.repo_commit_hash, download_entry.version, raw_url
+            ),
+            sources: self.network.downloads(&raw_url, cdn, immutable),
+            resume_root: root.join("incomplete"),
+            destination: netcfg::download::unique_path(&root.join("downloads"), &safe_file_name),
+            sha256: download_entry.sha256.clone(),
+            cancel,
+            options: DownloadOptions::default(),
+        };
+        let result = self
+            .downloader
+            .download(request, move |progress| {
+                if let Some(cb) = progress_cb.as_ref() {
+                    cb(ProgressData {
+                        progress: progress.fraction() as f32,
+                        status: if progress.finished {
+                            "finished".into()
+                        } else {
+                            String::new()
+                        },
+                    });
+                }
+            })
+            .await?;
+        Ok(result.path)
     }
 
     async fn refresh_inner(&self, cfg: &str) -> anyhow::Result<()> {
@@ -1315,68 +1423,27 @@ impl OfficialV2Provider {
             cdn = GitHubCdn::Raw;
         }
         self.cdn.store(Arc::new(cdn));
-        // 更新index
-        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/index_v2.csv");
-        let raw = self
-            .github_aware_bytes(&url)
-            .await
-            .with_context(|| format!("failed to request index_v2.csv from {url}"))?;
-
-        let sanitized = strip_zero_width(&String::from_utf8_lossy(&raw));
-        let mut list: Vec<IndexV2> = Vec::new();
-        let mut csv_read = csv::ReaderBuilder::new()
-            .trim(csv::Trim::All)
-            .from_reader(sanitized.as_bytes());
-        for it in csv_read.deserialize::<IndexV2>() {
-            match it {
-                Ok(mut i) => {
-                    if &i.id == "<placeholder>" {
-                        let n = self.placeholder_index.load_full().clone();
-                        self.placeholder_index.store(Arc::new(*n + 1));
-                        i.id = format!("placeholder_{}", n);
-                        list.push(i);
-                    } else {
-                        list.push(i);
-                    }
-                }
-                Err(err) => {
-                    log::warn!("[OfficialV2] skipped malformed index_v2 row: {err}");
-                }
-            }
-        }
-        // 拉到空索引基本意味着响应被 CDN 弄坏了；宁可报错也不要把
-        // 已有的良好索引覆盖成空。
-        if list.is_empty() {
-            anyhow::bail!("index_v2.csv parsed to an empty index");
-        }
-        self.index.store(Arc::new(list));
-        self.split_index(114514, SortRuleV2::Random);
-
-        // 更新设备map
-        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/devices_v2.json");
-        let bytes = self
-            .github_aware_bytes(&url)
-            .await
-            .with_context(|| format!("failed to request devices_v2.json from {url}"))?;
-        let map: DeviceMapV2 = serde_json::from_slice(&bytes)
-            .context("failed to parse devices_v2.json")?;
-        self.device_map.store(Arc::new(map));
-
-        // 更新探索页
-        let url = (*self.cdn.load_full()).convert_url("https://raw.githubusercontent.com/AstralSightStudios/AstroBox-Repo/refs/heads/main/explore_v2p1.jsonc");
-        let bytes = self
-            .github_aware_bytes(&url)
-            .await
-            .with_context(|| format!("failed to request explore_v2p1.jsonc from {url}"))?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let mut explore: serde_json::Value = parse_jsonc(&text)
-            .with_context(|| format!("failed to parse explore_v2p1.jsonc from {url}"))?;
-        self.normalize_explore_v2p1_payload(&mut explore)
-            .await
-            .context("failed to normalize explore_v2p1.jsonc")?;
-        self.explore.store(Arc::new(explore));
-
-        Ok(())
+        let base = self.build_repo_raw_url(
+            COMMUNITY_REPO_OWNER,
+            COMMUNITY_REPO_NAME,
+            COMMUNITY_REPO_COMMIT,
+        );
+        let index_url = format!("{base}/index_v2.csv");
+        let devices_url = format!("{base}/devices_v2.json");
+        let explore_url = format!("{base}/explore_v2p1.jsonc");
+        let (index, devices, explore) = tokio::join!(
+            self.fetch_metadata(&index_url, cdn, network::parse_index),
+            self.fetch_metadata(&devices_url, cdn, network::parse_devices),
+            self.fetch_metadata(&explore_url, cdn, network::parse_explore),
+        );
+        let explore = match explore {
+            Ok(mut value) => self
+                .normalize_explore_v2p1_payload(&mut value)
+                .await
+                .map(|()| value),
+            Err(error) => Err(error),
+        };
+        publish_refresh(&self.catalog, &self.explore, index, devices, explore)
     }
 }
 
@@ -1391,22 +1458,40 @@ impl CommunityProvider for OfficialV2Provider {
     }
 
     async fn refresh(&self, cfg: &str) -> anyhow::Result<()> {
-        self.state.store(Arc::new(ProviderState::Updating));
-
-        // 失败必须落到 Failed 态：否则 UI 永远停留在 Updating，
-        // 既看不到错误也不会触发重试。
-        match self.refresh_inner(cfg).await {
-            Ok(()) => {
-                self.state.store(Arc::new(ProviderState::Ready));
-                Ok(())
-            }
-            Err(err) => {
-                log::error!("[OfficialV2] refresh failed: {err:#}");
-                self.state
-                    .store(Arc::new(ProviderState::Failed(format!("{err:#}"))));
-                Err(err)
-            }
-        }
+        let key = serde_json::from_str::<serde_json::Value>(cfg)
+            .unwrap_or(serde_json::Value::Null)
+            .to_string();
+        self.refresh_flights
+            .run(key, async {
+                let _lock = self.refresh_lock.lock().await;
+                self.state.store(Arc::new(ProviderState::Updating));
+                struct RefreshGuard<'a>(&'a ArcSwap<ProviderState>);
+                impl Drop for RefreshGuard<'_> {
+                    fn drop(&mut self) {
+                        if matches!(self.0.load().as_ref(), ProviderState::Updating) {
+                            self.0.store(Arc::new(ProviderState::Failed(
+                                "provider refresh cancelled; retry".into(),
+                            )));
+                        }
+                    }
+                }
+                let _guard = RefreshGuard(&self.state);
+                // 失败必须落到 Failed 态：否则 UI 永远停留在 Updating，
+                // 既看不到错误也不会触发重试。
+                match self.refresh_inner(cfg).await {
+                    Ok(()) => {
+                        self.state.store(Arc::new(ProviderState::Ready));
+                        Ok(())
+                    }
+                    Err(err) => {
+                        log::error!("[OfficialV2] refresh failed: {err:#}");
+                        self.state
+                            .store(Arc::new(ProviderState::Failed(format!("{err:#}"))));
+                        Err(err)
+                    }
+                }
+            })
+            .await
     }
 
     async fn get_page(
@@ -1415,7 +1500,8 @@ impl CommunityProvider for OfficialV2Provider {
         limit: u32,
         search: SearchConfig,
     ) -> anyhow::Result<Vec<ManifestItemV2>> {
-        let index = self.index.load().clone();
+        let catalog = self.catalog.load_full();
+        let index = catalog.index.clone();
         let mut filtered_index = (*index).clone();
 
         // 先根据搜索条件过滤整个索引
@@ -1437,7 +1523,8 @@ impl CommunityProvider for OfficialV2Provider {
             .collect::<Vec<_>>();
             let mut devices = Vec::new();
 
-            self.device_map()
+            catalog
+                .device_map
                 .xiaomi
                 .values()
                 .filter(|e| categories.contains(&e.name))
@@ -1608,7 +1695,7 @@ impl CommunityProvider for OfficialV2Provider {
             CANOPUS.to_string(),
         ];
 
-        let device_map = self.device_map.load();
+        let device_map = self.catalog.load().device_map.clone();
         device_map
             .xiaomi
             .values()
@@ -1625,7 +1712,7 @@ impl CommunityProvider for OfficialV2Provider {
         Ok(categories)
     }
     async fn get_item_manifest(&self, item_id: String) -> anyhow::Result<ManifestV2> {
-        let index = self.index.load().clone();
+        let index = self.catalog.load().index.clone();
         let target_item = index.iter().find(|item| item.id == item_id);
 
         if let Some(item) = target_item {
@@ -1714,177 +1801,26 @@ impl CommunityProvider for OfficialV2Provider {
         item_id: String,
         device: String,
         progress_cb: Option<Box<dyn Fn(ProgressData) + Send>>,
-    ) -> anyhow::Result<std::path::PathBuf> {
-        let index = self.index.load();
-        let index_ref = index.clone();
-
-        // 优先根据id查找，找不到再跟名称
-        // 这是为了兼容v1的manifest无id
-        let item = index_ref
-            .iter()
-            .find(|entry| entry.id == item_id)
-            .or_else(|| index_ref.iter().find(|entry| entry.name == item_id))
-            .cloned()
-            .ok_or_else(|| anyhow!("Item not found by id or name"))?;
-
-        let manifest = self
-            .get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash)
+    ) -> anyhow::Result<PathBuf> {
+        self.download_resource(item_id, device, progress_cb, CancellationToken::new())
             .await
-            .with_context(|| format!("failed to fetch manifest for {}", item.name))?;
-
-        let downloads = &manifest.downloads;
-        let (resolved_device, download_entry) = downloads
-            .get(&device)
-            .map(|entry| (device.as_str(), entry))
-            .or_else(|| downloads.get("default").map(|entry| ("default", entry)))
-            .or_else(|| downloads.iter().next().map(|(key, entry)| (key.as_str(), entry)))
-            .map(|(key, entry)| (key.to_string(), entry.clone()))
-            .ok_or_else(|| anyhow!("no downloadable artifact for device `{device}`"))?;
-
-        let mut file_name = download_entry.file_name.trim().to_string();
-        if file_name.is_empty() {
-            if let Some(url) = &download_entry.url {
-                if let Some(name) = url.split('/').last() {
-                    file_name = name.to_string();
-                }
-            }
-        }
-        if file_name.is_empty() {
-            return Err(anyhow!("download entry missing file name"));
-        }
-
-        let safe_file_name = sanitize_local_filename(&file_name);
-
-        let cdn = *self.cdn.load_full();
-        let resolved_url = if cdn.uses_astrobox_source_cdn() {
-            self.resolve_source_cdn_download_url(&item.id, Some(&resolved_device))
-                .await?
-        } else if let Some(url) = &download_entry.url {
-            cdn.convert_url(url)
-        } else {
-            format!(
-                "{}/{}",
-                self.build_repo_cdn_url_by_index_item(&item),
-                &file_name
-            )
-        };
-
-        let cache_root = self.cache_root()?;
-        let item_dir = cache_root.join(&item.id);
-        fs::create_dir_all(&item_dir)
-            .await
-            .with_context(|| format!("failed to create cache directory {}", item_dir.display()))?;
-
-        let final_path = item_dir.join(&safe_file_name);
-        let unique_suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tmp_path = item_dir.join(format!("{}.{}.part", unique_suffix, safe_file_name));
-        let response = self
-            .github_aware_send(&resolved_url)
-            .await
-            .with_context(|| format!("failed to request {}", resolved_url))?
-            .error_for_status()
-            .with_context(|| format!("download request returned error for {}", resolved_url))?;
-
-        let cleanup_path = tmp_path.clone();
-        let download_result = {
-            let final_path = final_path;
-            let tmp_path = tmp_path;
-            let progress_cb = progress_cb;
-            let response = response;
-            async move {
-                let mut file = File::create(&tmp_path).await.with_context(|| {
-                    format!("failed to create temp file {}", tmp_path.display())
-                })?;
-
-                if let Some(cb) = progress_cb.as_ref() {
-                    cb(ProgressData {
-                        progress: 0.0,
-                        status: "".into(),
-                    });
-                }
-
-                let total = response.content_length();
-                let mut stream = response.bytes_stream();
-                let mut downloaded: u64 = 0;
-                let mut last_emit = Instant::now();
-                let step_bytes = total.map(|t| cmp::max(1, t / 100));
-                let mut last_reported = 0u64;
-
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.with_context(|| "failed to read download chunk")?;
-                    downloaded += chunk.len() as u64;
-                    file.write_all(chunk.as_ref())
-                        .await
-                        .with_context(|| "failed to write download chunk")?;
-
-                    if let Some(cb) = progress_cb.as_ref() {
-                        let mut emit = last_emit.elapsed() >= Duration::from_millis(200);
-                        if !emit {
-                            if let Some(step) = step_bytes {
-                                if downloaded >= last_reported.saturating_add(step)
-                                    || total.map(|t| downloaded >= t).unwrap_or(false)
-                                {
-                                    emit = true;
-                                }
-                            }
-                        }
-
-                        if emit {
-                            let progress = match total {
-                                Some(total_len) if total_len > 0 => {
-                                    (downloaded as f32 / total_len as f32).clamp(0.0, 1.0)
-                                }
-                                _ => 0.0,
-                            };
-                            cb(ProgressData {
-                                progress,
-                                status: "".into(),
-                            });
-                            last_emit = Instant::now();
-                            if step_bytes.is_some() {
-                                last_reported = downloaded;
-                            }
-                        }
-                    }
-                }
-
-                file.flush()
-                    .await
-                    .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
-
-                drop(file);
-
-                fs::rename(&tmp_path, &final_path).await.with_context(|| {
-                    format!(
-                        "failed to move downloaded file {} -> {}",
-                        tmp_path.display(),
-                        final_path.display()
-                    )
-                })?;
-
-                if let Some(cb) = progress_cb.as_ref() {
-                    cb(ProgressData {
-                        progress: 1.0,
-                        status: "finished".into(),
-                    });
-                }
-
-                Ok::<_, anyhow::Error>(final_path.clone())
-            }
-        }
-        .await;
-
-        if download_result.is_err() {
-            let _ = fs::remove_file(&cleanup_path).await;
-        }
-
-        download_result
     }
+
+    async fn download_with_cancel(
+        &self,
+        item_id: String,
+        device: String,
+        progress_cb: Option<Box<dyn Fn(ProgressData) + Send>>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<PathBuf> {
+        // Metadata preparation is cancellable too; the engine itself drains its
+        // file writers cooperatively rather than dropping an active download.
+        self.download_resource(item_id, device, progress_cb, cancel)
+            .await
+    }
+
     async fn get_total_items(&self) -> anyhow::Result<u64> {
-        Ok(self.index.load().len() as u64)
+        Ok(self.catalog.load().index.len() as u64)
     }
 
     async fn probe_download_size(
@@ -1894,8 +1830,12 @@ impl CommunityProvider for OfficialV2Provider {
     ) -> anyhow::Result<Option<u64>> {
         let entry = self.resolve_download_entry(item_id, device, false).await?;
         let url = entry.url.clone().context("download url missing")?;
-        let resp = self.github_aware_get(&url).await?;
-        Ok(resp.content_length())
+        let cdn = *self.cdn.load_full();
+        netcfg::download::probe_size(&netcfg::download::DownloadSource::new(
+            self.network.download_client(cdn),
+            url,
+        ))
+        .await
     }
 }
 
@@ -1950,6 +1890,75 @@ fn sanitize_local_filename(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_device_map_never_publishes_half_of_a_new_catalog() {
+        let catalog = ArcSwap::from_pointee(Catalog {
+            index: Arc::new(Vec::new()),
+            device_map: Arc::new(DeviceMapV2::default()),
+        });
+        let old = catalog.load_full();
+        let explore = ArcSwap::from_pointee(ExploreState {
+            value: Arc::new(serde_json::Value::Null),
+            error: None,
+        });
+        assert!(
+            publish_refresh(
+                &catalog,
+                &explore,
+                Ok(Vec::new()),
+                Err(anyhow!("offline")),
+                Ok(serde_json::json!({"sections":[]}))
+            )
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&old, &catalog.load_full()));
+    }
+
+    #[test]
+    fn exploration_failure_does_not_block_a_valid_catalog() {
+        let catalog = ArcSwap::from_pointee(Catalog {
+            index: Arc::new(Vec::new()),
+            device_map: Arc::new(DeviceMapV2::default()),
+        });
+        let old = catalog.load_full();
+        let explore = ArcSwap::from_pointee(ExploreState {
+            value: Arc::new(serde_json::Value::Null),
+            error: None,
+        });
+        publish_refresh(
+            &catalog,
+            &explore,
+            Ok(Vec::new()),
+            Ok(DeviceMapV2::default()),
+            Err(anyhow!("explore unavailable")),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&old, &catalog.load_full()));
+        assert_eq!(explore.load().error.as_deref(), Some("explore unavailable"));
+    }
+
+    #[test]
+    fn exploration_failure_keeps_payload_loaded_earlier_in_this_run() {
+        let catalog = ArcSwap::from_pointee(Catalog {
+            index: Arc::new(Vec::new()),
+            device_map: Arc::new(DeviceMapV2::default()),
+        });
+        let explore = ArcSwap::from_pointee(ExploreState {
+            value: Arc::new(serde_json::json!({"sections":[]})),
+            error: None,
+        });
+        publish_refresh(
+            &catalog,
+            &explore,
+            Ok(Vec::new()),
+            Ok(DeviceMapV2::default()),
+            Err(anyhow!("explore unavailable")),
+        )
+        .unwrap();
+        assert!(explore.load().error.is_none());
+        assert!(!explore.load().value.is_null());
+    }
 
     #[test]
     fn raw_url_to_github_api_basic() {
