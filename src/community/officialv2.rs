@@ -1590,8 +1590,9 @@ impl CommunityProvider for OfficialV2Provider {
                     {
                         return true;
                     }
-                    // 拼音匹配路径：中文名称/标签支持简拼与全拼搜索
+                    // 拼音匹配路径：中文名称/标签/作者支持简拼与全拼搜索
                     pinyin_matcher.is_match(&item.name)
+                        || pinyin_matcher.is_match(&item.repo_owner)
                         || item.tags.iter().any(|t| pinyin_matcher.is_match(t))
                 });
             }
