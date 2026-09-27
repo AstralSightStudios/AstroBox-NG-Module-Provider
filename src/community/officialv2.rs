@@ -1,5 +1,6 @@
 mod flight;
 mod network;
+mod res_pack;
 
 use flight::Flights;
 use netcfg::download::{CancellationToken, DownloadManager, DownloadOptions, DownloadRequest};
@@ -47,6 +48,7 @@ const HIDE_FORCE_PAID: &str = "hide_force_paid"; // 隐藏强制付费
 const QUICK_APP: &str = "quick_app"; // 快应用
 const WATCHFACE: &str = "watchface"; // 表盘
 const CANOPUS: &str = "canopus"; // 模块
+const RES_PACK: &str = "res_pack"; // 资源包
 const ACCOUNT_SOURCE_STORAGE_KEY: &str = "network_account_source_cfg";
 const ASTROBOX_ACCOUNT_PROVIDER: &str = "astrobox";
 
@@ -1199,7 +1201,7 @@ impl OfficialV2Provider {
         self.manifest_flights
             .run(format!("{}:{base}", cdn.id()), async {
                 let url_v2 = format!("{base}/manifest_v2.json");
-                match self
+                let mut manifest = match self
                     .fetch_metadata(&url_v2, cdn, network::parse_manifest)
                     .await
                 {
@@ -1212,7 +1214,9 @@ impl OfficialV2Provider {
                         .await
                         .context("failed to fetch legacy manifest"),
                     Err(error) => Err(error),
-                }
+                }?;
+                res_pack::add_manager_requirement(&mut manifest)?;
+                Ok(manifest)
             })
             .await
     }
@@ -1512,6 +1516,7 @@ impl CommunityProvider for OfficialV2Provider {
                 (QUICK_APP, ResourceTypeV2::QuickApp),
                 (WATCHFACE, ResourceTypeV2::WatchFace),
                 (CANOPUS, ResourceTypeV2::Canopus),
+                (RES_PACK, ResourceTypeV2::ResPack),
             ]
             .into_iter()
             .filter_map(|(category, resource_type)| {
@@ -1694,6 +1699,7 @@ impl CommunityProvider for OfficialV2Provider {
             QUICK_APP.to_string(),
             WATCHFACE.to_string(),
             CANOPUS.to_string(),
+            RES_PACK.to_string(),
         ];
 
         let device_map = self.catalog.load().device_map.clone();

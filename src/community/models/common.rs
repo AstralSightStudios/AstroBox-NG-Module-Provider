@@ -143,10 +143,8 @@ pub enum ResourceTypeV2 {
     Canopus, // 模块
     #[serde(rename = "firmware")]
     Firmware, // 固件
-    #[serde(rename = "fontpack")]
-    FontPack, // 字体包
-    #[serde(rename = "iconpack")]
-    IconPack, // 图标包
+    #[serde(rename = "res_pack")]
+    ResPack, // 资源包
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
