@@ -123,8 +123,10 @@ with four digits, `corona.json` included) and the ZIP central-directory sanity b
 `canopus-resource-pack` (format marker), `corona.json` (manifest file), `ng.lst.corona` /
 `corona` (module package and runtime ids), `Corona` (authoring tool and project brand),
 `.crpack` (container), `res_pack` (index type). The manifest filename was `canora.json` before the
-Corona rename; no pack had been published at that point, so no legacy name is accepted. The format
-marker still reads `canopus-resource-pack` because it is a frozen wire constant that the receiver
+Corona rename. The sender accepts the legacy `canora.json` name for compatibility and preserves
+its original transfer path; both names must be at the archive root, and a pack containing both
+is rejected as ambiguous. Legacy-name acceptance by the sender does not guarantee acceptance by
+the device Manager. New packs must use `corona.json`. The format marker still reads `canopus-resource-pack` because it is a frozen wire constant that the receiver
 matches literally, and changing it would require a `formatVersion` bump.
 
 ## Base91 interoperability
