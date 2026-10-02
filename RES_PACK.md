@@ -16,9 +16,9 @@ Inside the ZIP archive:
 
 ## Installation via Interconnect
 
-- Every resource-pack manifest gets an `OfficialV2` resource dependency on `ng.lst.conora` in `ext.bundledResources.required`, preserving other dependencies.
+- Every resource-pack manifest gets an `OfficialV2` resource dependency on `ng.lst.corona` in `ext.bundledResources.required`, preserving other dependencies.
 - The installation queue checks the target device. If missing, it downloads and installs the compatible Conora quick app as a prerequisite within that queue task; failure prevents the pack transfer.
-- During installation, the `.zip` file is unpacked in memory by corelib, `ng.lst.conora` is launched on the wearable, and the extracted files are sent individually over interconnect according to the draft protocol. Resource packs never use the normal Mass file-install route. Currently supported on native Xiaomi devices.
+- During installation, the `.zip` file is unpacked in memory by corelib, `ng.lst.corona` is launched on the wearable, and the extracted files are sent individually over interconnect according to the draft protocol. Resource packs never use the normal Mass file-install route. Currently supported on native Xiaomi devices.
 - Protocol v1 uses H/T/P/F/A/C/E, at most 18,000 characters per complete message and a window of at most four chunks. Payload chunks default to 12,000 bytes, reduced for a smaller negotiated text limit. ACKs mean receiver-side writes, not Bluetooth/platform send completion.
 - Each control request waits for the matching acknowledgement. Chunks have independent acknowledgement deadlines; only unconfirmed chunks are retried. Each request/chunk has at most four attempts, eight seconds per acknowledgement wait.
 - A retry of the **same installation task** uses `resume`, the exact source fingerprint and the original chunk size, and honors `receivedRanges`. Starting a new task uses `replace`.

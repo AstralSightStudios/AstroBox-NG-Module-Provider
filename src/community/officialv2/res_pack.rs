@@ -26,14 +26,14 @@ pub(super) fn add_manager_requirement(manifest: &mut ManifestV2) -> anyhow::Resu
         .context("bundledResources.required must be an array")?;
     if !required.iter().any(|entry| {
         entry["type"] == "resource"
-            && entry["id"] == "ng.lst.conora"
+            && entry["id"] == "ng.lst.corona"
             && entry
                 .get("provider")
                 .is_none_or(|provider| provider == "OfficialV2")
     }) {
         required.insert(
             0,
-            serde_json::json!({"type":"resource","id":"ng.lst.conora","provider":"OfficialV2"}),
+            serde_json::json!({"type":"resource","id":"ng.lst.corona","provider":"OfficialV2"}),
         );
     }
     Ok(())
