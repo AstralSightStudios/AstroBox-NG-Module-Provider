@@ -40,7 +40,8 @@ use rand::seq::SliceRandom;
 use regex::Regex;
 use reqwest::{StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use frontbridge::runtime::AppHandle;
+use tauri::Manager;
 use tokio::sync::Mutex as AsyncMutex;
 
 const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
