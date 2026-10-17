@@ -1261,6 +1261,38 @@ impl OfficialV2Provider {
         Ok(entry)
     }
 
+    /// Canopus updates match native module ids and resource types exactly.
+    /// Never fall back to an app/display name or another device's download.
+    pub async fn resolve_canopus_download_entry(
+        &self,
+        module_id: &str,
+        device: &str,
+    ) -> anyhow::Result<ManifestDownloadV2> {
+        let index = self.catalog.load().index.clone();
+        let item = index.iter().find(|item|
+            item.id == module_id && item.restype == ResourceTypeV2::Canopus
+        ).ok_or_else(|| anyhow!("Canopus module not found by exact id `{module_id}`"))?;
+        let manifest = self.get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash).await?;
+        anyhow::ensure!(
+            manifest.item.id == module_id && manifest.item.restype == ResourceTypeV2::Canopus,
+            "manifest is not Canopus module `{module_id}`"
+        );
+        let mut entry = manifest.downloads.get(device)
+            .or_else(|| manifest.downloads.get("default"))
+            .cloned()
+            .ok_or_else(|| anyhow!("no Canopus download for device `{device}` or default"))?;
+        anyhow::ensure!(entry.file_name.to_ascii_lowercase().ends_with(".canopus"),
+            "Canopus download must be a native .canopus package");
+        anyhow::ensure!(entry.version_code.is_none_or(|v| v <= u64::from(u32::MAX)),
+            "Canopus versionCode exceeds the native module ABI");
+        if entry.display_name.is_none() {
+            entry.display_name = self.device_map_id_to_name(device);
+        }
+        let raw_url = self.download_raw_url(item, &entry);
+        entry.url = Some(self.cdn.load_full().convert_url(&raw_url));
+        Ok(entry)
+    }
+
     /// Resolve the display icon URL for an item by id (or name), if it exists
     /// in the in-memory index. Pure in-memory lookup, no network I/O.
     pub fn resolve_item_icon(&self, item_id: &str) -> Option<String> {
