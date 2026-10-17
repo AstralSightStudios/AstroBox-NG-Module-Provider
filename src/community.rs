@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub use cancel::CancellationToken;
+
+pub mod cancel;
 pub mod legacyparse;
 pub mod models;
 pub mod officialv2;
@@ -65,13 +68,12 @@ pub trait CommunityProvider: Send + Sync {
         item_id: String,
         device: String,
         progress_cb: Option<Box<dyn Fn(models::common::ProgressData) + Send>>,
-        cancel: netcfg::download::CancellationToken,
+        cancel: CancellationToken,
     ) -> anyhow::Result<std::path::PathBuf> {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(anyhow::anyhow!("download_cancelled")),
-            result = self.download(item_id, device, progress_cb) => result,
-        }
+        cancel
+            .run(self.download(item_id, device, progress_cb))
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("download_cancelled")))
     }
 
     async fn get_total_items(&self) -> anyhow::Result<u64>;

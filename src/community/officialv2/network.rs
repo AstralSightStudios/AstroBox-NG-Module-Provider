@@ -1,7 +1,7 @@
 use super::*;
+use futures::future::{Either, select};
 use futures_util::stream::FuturesUnordered;
-use netcfg::download::DownloadSource;
-use reqwest::Client;
+use hostio::http::{Client, DownloadSource};
 
 const METADATA_LIMIT: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -10,50 +10,25 @@ const HEDGE_DELAY: Duration = Duration::from_millis(800);
 
 #[derive(Default)]
 pub(super) struct Network {
-    clients: Mutex<Option<(netcfg::DohConfig, Client, Client)>>,
-    download_clients: Mutex<Option<(netcfg::DohConfig, Client, Client)>>,
     health: Mutex<HashMap<&'static str, (u32, Duration, Instant)>>,
 }
 
 impl Network {
+    /// 元数据请求的客户端：GitHub 域名是否走 DoH 按 CDN 决定（DoH 解析配置由宿主统一应用）。
     pub(super) fn client(&self, cdn: GitHubCdn) -> Client {
-        self.route_client(cdn, false)
-    }
-    pub(super) fn download_client(&self, cdn: GitHubCdn) -> Client {
-        self.route_client(cdn, true)
+        Client::builder()
+            .github_doh(cdn.uses_github_doh())
+            .redirect(hostio::http::redirect::Policy::limited(5))
+            .build()
+            .expect("failed to create provider client")
     }
 
-    fn route_client(&self, cdn: GitHubCdn, download: bool) -> Client {
-        let config = netcfg::get_doh_config();
-        let mut clients = (if download {
-            &self.download_clients
-        } else {
-            &self.clients
-        })
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-        if clients.as_ref().is_none_or(|(old, _, _)| *old != config) {
-            let build = |doh| {
-                netcfg::github_client_builder(doh)
-                    .redirect(if download {
-                        reqwest::redirect::Policy::none()
-                    } else {
-                        reqwest::redirect::Policy::limited(5)
-                    })
-                    .no_gzip()
-                    .no_brotli()
-                    .no_deflate()
-                    .no_zstd()
-                    .build()
-                    .expect("failed to create provider client")
-            };
-            *clients = Some((config, build(false), build(true)));
-        }
-        let (_, raw, doh) = clients.as_ref().unwrap();
-        if cdn.uses_github_doh() {
-            doh.clone()
-        } else {
-            raw.clone()
+    /// 下载来源（宿主的下载器自己处理重定向与解压，保证续传偏移正确）。
+    pub(super) fn download_source(&self, cdn: GitHubCdn, url: String) -> DownloadSource {
+        DownloadSource {
+            url,
+            github: Some(cdn.uses_github_doh()),
+            ..DownloadSource::default()
         }
     }
 
@@ -133,7 +108,7 @@ impl Network {
             .into_iter()
             .filter(|(_, url)| !url.starts_with("https://api.gitcode.com/"))
             .map(|(cdn, url)| {
-                let mut source = DownloadSource::new(self.route_client(cdn, true), url);
+                let mut source = self.download_source(cdn, url);
                 source.immutable = immutable;
                 source
             })
@@ -170,21 +145,35 @@ impl OfficialV2Provider {
         if let Some((cdn, url)) = routes.next() {
             requests.push(self.metadata_attempt(cdn, url, &parse));
         }
-        let deadline = tokio::time::sleep(OPERATION_TIMEOUT);
-        let hedge = tokio::time::sleep(HEDGE_DELAY);
-        tokio::pin!(deadline, hedge);
+        // 有在途请求时：首个请求 HEDGE_DELAY 内没结果就并发下一条线路；总时限 OPERATION_TIMEOUT。
+        let started = Instant::now();
         let mut hedged = false;
         let mut failures = Vec::new();
         let mut not_found_count = 0;
         let mut authoritative_not_found = false;
         loop {
-            tokio::select! {
-                _ = &mut deadline => { failures.push("metadata request deadline exceeded".to_string()); break; }
-                _ = &mut hedge, if !hedged => {
-                    hedged = true;
-                    if let Some((cdn, url)) = routes.next() { requests.push(self.metadata_attempt(cdn, url, &parse)); }
+            let elapsed = started.elapsed();
+            if elapsed >= OPERATION_TIMEOUT {
+                failures.push("metadata request deadline exceeded".to_string());
+                break;
+            }
+            let wait = if hedged {
+                OPERATION_TIMEOUT - elapsed
+            } else {
+                HEDGE_DELAY.saturating_sub(elapsed).min(OPERATION_TIMEOUT - elapsed)
+            };
+            let next = std::pin::pin!(requests.next());
+            let timer = std::pin::pin!(hostio::rt::sleep(wait));
+            match select(next, timer).await {
+                Either::Right(_) => {
+                    if !hedged {
+                        hedged = true;
+                        if let Some((cdn, url)) = routes.next() {
+                            requests.push(self.metadata_attempt(cdn, url, &parse));
+                        }
+                    }
                 }
-                result = requests.next() => {
+                Either::Left((result, _)) => {
                     let Some((route, result)) = result else { break };
                     match result {
                         Ok(value) => return Ok(value),
@@ -194,7 +183,9 @@ impl OfficialV2Provider {
                                 authoritative_not_found |= matches!(route, GitHubCdn::Raw | GitHubCdn::GitHubDoh);
                             }
                             failures.push(format!("{}: {error:#}", route.id()));
-                            if let Some((cdn, url)) = routes.next() { requests.push(self.metadata_attempt(cdn, url, &parse)); }
+                            if let Some((cdn, url)) = routes.next() {
+                                requests.push(self.metadata_attempt(cdn, url, &parse));
+                            }
                         }
                     }
                 }
@@ -215,7 +206,7 @@ impl OfficialV2Provider {
         parse: &(impl Fn(&[u8]) -> anyhow::Result<T> + Sync),
     ) -> (GitHubCdn, anyhow::Result<T>) {
         let started = Instant::now();
-        let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let result = hostio::rt::timeout(REQUEST_TIMEOUT, async {
             let mut response = self.github_aware_send(&url, cdn).await?;
             if response.status() == StatusCode::NOT_FOUND {
                 return Err(MetadataFailure {

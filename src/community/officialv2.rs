@@ -3,7 +3,6 @@ mod network;
 mod res_pack;
 
 use flight::Flights;
-use netcfg::download::{CancellationToken, DownloadManager, DownloadOptions, DownloadRequest};
 
 use std::{
     collections::HashMap,
@@ -18,7 +17,7 @@ use std::{
 use crate::{
     cdn::GitHubCdn,
     community::{
-        CommunityProvider,
+        CancellationToken, CommunityProvider,
         models::{
             common::{
                 ManifestDownloadV2, ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData,
@@ -38,10 +37,8 @@ use ib_pinyin::{matcher::PinyinMatcher, pinyin::PinyinNotation};
 use memchr::memmem::Finder;
 use rand::seq::SliceRandom;
 use regex::Regex;
-use reqwest::{StatusCode, header::HeaderMap};
+use hostio::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use frontbridge::runtime::AppHandle;
-use tauri::Manager;
 use tokio::sync::Mutex as AsyncMutex;
 
 const HIDE_PAID: &str = "hide_paid"; // 隐藏付费
@@ -438,13 +435,11 @@ pub fn validate_index_bytes(bytes: &[u8]) -> anyhow::Result<()> {
 
 pub struct OfficialV2Provider {
     cdn: ArcSwap<GitHubCdn>,
-    app_handle: AppHandle,
     catalog: ArcSwap<Catalog>,
     explore: ArcSwap<ExploreState>,
     refresh_flights: Flights<()>,
     refresh_lock: AsyncMutex<()>,
     manifest_flights: Flights<ManifestV2>,
-    downloader: DownloadManager,
     network: network::Network,
     state: ArcSwap<ProviderState>,
     // 图片 base64 内联缓存：cosKey -> data URI（commit 寻址、不可变）
@@ -457,10 +452,9 @@ pub struct OfficialV2Provider {
 }
 
 impl OfficialV2Provider {
-    pub fn new(cdn: GitHubCdn, app_handle: AppHandle) -> Self {
+    pub fn new(cdn: GitHubCdn) -> Self {
         Self {
             cdn: ArcSwap::new(Arc::new(cdn)),
-            app_handle,
             catalog: ArcSwap::from_pointee(Catalog {
                 index: Arc::new(Vec::new()),
                 device_map: Arc::new(DeviceMapV2::default()),
@@ -472,7 +466,6 @@ impl OfficialV2Provider {
             refresh_flights: Flights::default(),
             refresh_lock: AsyncMutex::new(()),
             manifest_flights: Flights::default(),
-            downloader: DownloadManager::default(),
             network: network::Network::default(),
             state: ArcSwap::new(Arc::new(ProviderState::Updating)),
             image_b64_cache: Mutex::new(HashMap::new()),
@@ -485,13 +478,11 @@ impl OfficialV2Provider {
         self.cdn.store(Arc::new(cdn));
     }
 
-    fn cache_root(&self) -> anyhow::Result<PathBuf> {
-        let base = self
-            .app_handle
-            .path()
-            .app_cache_dir()
+    async fn cache_root(&self) -> anyhow::Result<PathBuf> {
+        let base = hostio::path::app_cache_dir()
+            .await
             .map_err(|err| anyhow!("app cache directory unavailable: {err}"))?;
-        Ok(base.join("community").join("official_v2"))
+        Ok(PathBuf::from(base).join("community").join("official_v2"))
     }
 
     pub fn device_map(&self) -> Arc<DeviceMapV2> {
@@ -660,10 +651,7 @@ impl OfficialV2Provider {
     }
 
     async fn current_account_source(&self) -> AccountSourceId {
-        account::local_storage_get_json::<AccountSourceConfig>(
-            &self.app_handle,
-            ACCOUNT_SOURCE_STORAGE_KEY,
-        )
+        account::local_storage_get_json::<AccountSourceConfig>(ACCOUNT_SOURCE_STORAGE_KEY)
         .await
         .ok()
         .flatten()
@@ -673,7 +661,7 @@ impl OfficialV2Provider {
 
     async fn current_astrobox_token(&self) -> anyhow::Result<String> {
         let account = AccountStore::new(ASTROBOX_ACCOUNT_PROVIDER)
-            .load(&self.app_handle)
+            .load()
             .await
             .context("failed to read AstroBox account")?
             .ok_or_else(|| anyhow!("请先登录 AstroBox 账号"))?;
@@ -688,7 +676,7 @@ impl OfficialV2Provider {
     // 结果按 AstroBox token 缓存整个应用生命周期，锁跨 await 持有实现单飞。
     async fn current_github_token(&self) -> Option<String> {
         let account = match AccountStore::new(ASTROBOX_ACCOUNT_PROVIDER)
-            .load(&self.app_handle)
+            .load()
             .await
         {
             Ok(Some(account)) => account,
@@ -835,7 +823,7 @@ impl OfficialV2Provider {
 
     // 用缓存的 GitHub token 走 Contents API（5000/h）绕开 raw 限流。
     // 拿不到 token 或任何失败都返回 None，由调用方回退普通 raw 请求。
-    async fn fetch_via_github_api(&self, api_url: &str) -> Option<reqwest::Response> {
+    async fn fetch_via_github_api(&self, api_url: &str) -> Option<hostio::http::Response> {
         let token = self.current_github_token().await?;
 
         let response = match crate::net::default_client()
@@ -878,7 +866,7 @@ impl OfficialV2Provider {
         &self,
         url: &str,
         cdn: GitHubCdn,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<hostio::http::Response> {
         let api_url = if cdn == GitHubCdn::Raw {
             Self::raw_url_to_github_api(url)
         } else {
@@ -1006,7 +994,7 @@ impl OfficialV2Provider {
             .error_for_status()?;
         let content_type = resp
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(hostio::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let bytes = resp.bytes().await?;
@@ -1319,11 +1307,11 @@ impl OfficialV2Provider {
             .cloned()
             .ok_or_else(|| anyhow!("Item not found by id or name"))?;
 
-        let manifest = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(anyhow!("download_cancelled")),
-            manifest = self.get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash) => manifest,
-        }.with_context(|| format!("failed to fetch manifest for {}", item.name))?;
+        let manifest = cancel
+            .run(self.get_manifest(&item.repo_owner, &item.repo_name, &item.repo_commit_hash))
+            .await
+            .ok_or_else(|| anyhow!("download_cancelled"))?
+            .with_context(|| format!("failed to fetch manifest for {}", item.name))?;
 
         let downloads = &manifest.downloads;
         let (resolved_device, download_entry) = downloads
@@ -1342,7 +1330,7 @@ impl OfficialV2Provider {
         let mut file_name = download_entry.file_name.trim().to_string();
         if file_name.is_empty() {
             if let Some(url) = &download_entry.url {
-                if let Ok(url) = reqwest::Url::parse(url) {
+                if let Ok(url) = hostio::http::Url::parse(url) {
                     if let Some(name) = url
                         .path_segments()
                         .and_then(|mut segments| segments.next_back())
@@ -1366,40 +1354,65 @@ impl OfficialV2Provider {
             self.download_raw_url(&item, &download_entry)
         };
 
-        let root = self.cache_root()?;
+        let root = self.cache_root().await?;
         let canonical_base =
             self.build_repo_raw_url(&item.repo_owner, &item.repo_name, &item.repo_commit_hash);
         let immutable = raw_url.starts_with(&format!("{canonical_base}/"))
             && (7..=40).contains(&item.repo_commit_hash.len())
             && item.repo_commit_hash.bytes().all(|b| b.is_ascii_hexdigit());
-        let request = DownloadRequest {
-            identity: format!(
+        let destination = unique_path(&root.join("downloads"), &safe_file_name);
+        let cancel_id = format!("officialv2-{}-{}", item.id, hostio::rt::now_millis());
+        let request = hostio::http::Download {
+            identity: Some(format!(
                 "{}\0{}\0{}\0{}\0{}",
                 item.id, resolved_device, item.repo_commit_hash, download_entry.version, raw_url
-            ),
+            )),
             sources: self.network.downloads(&raw_url, cdn, immutable),
-            resume_root: root.join("incomplete"),
-            destination: netcfg::download::unique_path(&root.join("downloads"), &safe_file_name),
+            resume_dir: Some(root.join("incomplete").to_string_lossy().into_owned()),
+            destination: destination.to_string_lossy().into_owned(),
             sha256: download_entry.sha256.clone(),
-            cancel,
-            options: DownloadOptions::default(),
+            progress: None,
+            cancel_id: Some(cancel_id.clone()),
         };
-        let result = self
-            .downloader
-            .download(request, move |progress| {
-                if let Some(cb) = progress_cb.as_ref() {
+        // 进度经宿主消息流回到这里，再交给调用方的回调（回调只要求 Send，放进 Mutex 才能跨 await 共享）。
+        let progress_cb = std::sync::Mutex::new(progress_cb);
+        let download = hostio::ipc::with_progress(
+            |progress| {
+                let mut request = request.clone();
+                request.progress = Some(progress);
+                async move { hostio::http::download(&request).await }
+            },
+            |value| {
+                let done = value["downloadedBytes"].as_u64().unwrap_or(0);
+                let total = value["totalBytes"].as_u64().unwrap_or(0);
+                let finished = value["finished"].as_bool().unwrap_or(false);
+                if let Some(cb) = progress_cb.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                     cb(ProgressData {
-                        progress: progress.fraction() as f32,
-                        status: if progress.finished {
+                        progress: if finished {
+                            1.0
+                        } else if total == 0 {
+                            0.0
+                        } else {
+                            (done as f64 / total as f64).clamp(0.0, 1.0) as f32
+                        },
+                        status: if finished {
                             "finished".into()
                         } else {
                             String::new()
                         },
                     });
                 }
-            })
-            .await?;
-        Ok(result.path)
+                async {}
+            },
+        );
+        let result = match cancel.run(download).await {
+            Some(result) => result.map_err(|err| anyhow!(err))?,
+            None => {
+                let _ = hostio::http::cancel_download(&cancel_id).await;
+                return Err(anyhow!("download_cancelled"));
+            }
+        };
+        Ok(PathBuf::from(result.path))
     }
 
     async fn refresh_inner(&self, cfg: &str) -> anyhow::Result<()> {
@@ -1436,7 +1449,7 @@ impl OfficialV2Provider {
         let index_url = format!("{base}/index_v2.csv");
         let devices_url = format!("{base}/devices_v2.json");
         let explore_url = format!("{base}/explore_v2p1.jsonc");
-        let (index, devices, explore) = tokio::join!(
+        let (index, devices, explore) = futures::join!(
             self.fetch_metadata(&index_url, cdn, network::parse_index),
             self.fetch_metadata(&devices_url, cdn, network::parse_devices),
             self.fetch_metadata(&explore_url, cdn, network::parse_explore),
@@ -1839,16 +1852,31 @@ impl CommunityProvider for OfficialV2Provider {
         let entry = self.resolve_download_entry(item_id, device, false).await?;
         let url = entry.url.clone().context("download url missing")?;
         let cdn = *self.cdn.load_full();
-        netcfg::download::probe_size(&netcfg::download::DownloadSource::new(
-            self.network.download_client(cdn),
-            url,
-        ))
-        .await
+        hostio::http::probe_size(&self.network.download_source(cdn, url))
+            .await
+            .map_err(|err| anyhow!(err))
     }
 }
 
 // raw.githubusercontent.com 限流时返回 429；GitHub 也会用 403 加限流头表示限流
 // （x-ratelimit-remaining: 0 或带 retry-after）。普通的 403 / 404 不算限流。
+/// 下载落地路径：随机前缀 + 清洗过的文件名（与 netcfg 的 `unique_path` 一致）。
+fn unique_path(root: &std::path::Path, name: &str) -> PathBuf {
+    let name = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    let name = name.trim().trim_matches('.');
+    let name = if name.is_empty() { "download.bin" } else { name };
+    root.join(format!("{:016x}-{name}", rand::random::<u64>()))
+}
+
 fn is_github_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return true;
@@ -1860,7 +1888,7 @@ fn is_github_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
         .get("x-ratelimit-remaining")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.trim() == "0");
-    remaining_exhausted || headers.contains_key(reqwest::header::RETRY_AFTER)
+    remaining_exhausted || headers.contains_key(hostio::http::header::RETRY_AFTER)
 }
 
 // 取 GitHub token 失败时是否属于暂时性错误（冷却后可重试）。
@@ -2035,7 +2063,7 @@ mod tests {
         assert!(is_github_rate_limited(StatusCode::FORBIDDEN, &exhausted));
 
         let mut retry_after = HeaderMap::new();
-        retry_after.insert(reqwest::header::RETRY_AFTER, "60".parse().unwrap());
+        retry_after.insert(hostio::http::header::RETRY_AFTER, "60".parse().unwrap());
         assert!(is_github_rate_limited(StatusCode::FORBIDDEN, &retry_after));
     }
 

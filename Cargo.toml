@@ -7,16 +7,15 @@ edition = "2024"
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 account = { path = "../account" }
-netcfg = { path = "../netcfg" }
-frontbridge = { path = "../frontbridge" }
+# 宿主 IO：HTTP、下载、存储、定时（原生与 WASM 两种编译形态共用）。
+hostio = { path = "../hostio" }
 serde = "1.0.228"
 serde_json = "1.0.145"
-reqwest = { version = "0.12.24", default-features = false, features = ["stream", "json", "rustls-tls"] }
 arc-swap = "1.7.1"
 rand = "0.9.2"
-tokio = { version = "1", features = ["fs", "io-util", "sync"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+futures = "0.3"
 futures-util = "0.3.31"
-tauri = { version = "2.11.3", default-features = false, features = ["rustls-tls"] }
 csv = "1.4.0"
 log = "0.4"
 regex = "1"
@@ -24,3 +23,6 @@ base64 = "0.22"
 urlencoding = "2"
 ib-pinyin = "0.3"
 memchr = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }

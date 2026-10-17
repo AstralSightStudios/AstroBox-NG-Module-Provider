@@ -1,9 +1,9 @@
-use reqwest::{Client, ClientBuilder};
+use hostio::http::{Client, ClientBuilder};
 
 pub fn default_client() -> Client {
-    netcfg::default_client()
+    Client::new()
 }
 
 pub fn default_client_builder() -> ClientBuilder {
-    netcfg::default_client_builder()
+    Client::builder()
 }
