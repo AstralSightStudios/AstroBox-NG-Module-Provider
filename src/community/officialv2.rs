@@ -20,7 +20,8 @@ use crate::{
         CancellationToken, CommunityProvider,
         models::{
             common::{
-                ManifestDownloadV2, ManifestItemV2, ManifestV2, PaidTypeV2, ProgressData,
+                CanopusDeviceCompat, ManifestDownloadV2, ManifestItemV2, ManifestV2, PaidTypeV2,
+                ProgressData,
                 ProviderState, ResourceTypeV2, SearchConfig, SortRuleV2,
             },
             official::{DeviceMapV2, DeviceV2, IndexV2},
@@ -1263,10 +1264,13 @@ impl OfficialV2Provider {
 
     /// Canopus updates match native module ids and resource types exactly.
     /// Never fall back to an app/display name or another device's download.
+    /// When the manifest says what the download needs (`canopus`) and the band's
+    /// own report is given, a download the band cannot run is refused here.
     pub async fn resolve_canopus_download_entry(
         &self,
         module_id: &str,
         device: &str,
+        band: Option<&CanopusDeviceCompat<'_>>,
     ) -> anyhow::Result<ManifestDownloadV2> {
         let index = self.catalog.load().index.clone();
         let item = index.iter().find(|item|
@@ -1285,6 +1289,11 @@ impl OfficialV2Provider {
             "Canopus download must be a native .canopus package");
         anyhow::ensure!(entry.version_code.is_none_or(|v| v <= u64::from(u32::MAX)),
             "Canopus versionCode exceeds the native module ABI");
+        if let (Some(needs), Some(band)) = (&entry.canopus, band) {
+            needs.check(band).map_err(|reason| {
+                anyhow!("Canopus download for `{module_id}` cannot run on this band: {reason}")
+            })?;
+        }
         if entry.display_name.is_none() {
             entry.display_name = self.device_map_id_to_name(device);
         }

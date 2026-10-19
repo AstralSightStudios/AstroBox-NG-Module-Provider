@@ -211,6 +211,7 @@ pub fn manifest_v1_to_v2(raw: serde_json::Value) -> anyhow::Result<ManifestV2> {
                     sha256,
                     display_name,
                     updatelogs,
+                    canopus: None,
                 },
             );
         }

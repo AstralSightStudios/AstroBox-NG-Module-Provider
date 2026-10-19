@@ -124,6 +124,64 @@ pub struct ManifestDownloadV2 {
     pub display_name: Option<String>,
     #[serde(default)]
     pub updatelogs: Option<Vec<ManifestDownloadUpdateLogV2>>,
+    /// What a native `.canopus` download needs from the band. Absent on every
+    /// other resource type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canopus: Option<ManifestCanopusV2>,
+}
+
+/// Compatibility of a native Canopus download (refactor-plan P5.7). A portable
+/// module lists no targets; a target-bound one lists every exact target id its
+/// package carries an artifact for.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ManifestCanopusV2 {
+    /// Module ABI major the package was built against.
+    pub abi: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// Lowest Supervisor framework revision the module needs.
+    #[serde(default, rename = "minFramework", skip_serializing_if = "Option::is_none")]
+    pub min_framework: Option<u32>,
+}
+
+/// What the connected band reports about itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanopusDeviceCompat<'a> {
+    /// `None` on a Supervisor too old to report it: a target is never guessed.
+    pub target_id: Option<&'a str>,
+    pub framework_revision: u32,
+    /// The module ABI major this client speaks.
+    pub abi_major: u32,
+}
+
+impl ManifestCanopusV2 {
+    /// Err names the first reason the download cannot run on this band.
+    pub fn check(&self, device: &CanopusDeviceCompat<'_>) -> Result<(), String> {
+        if self.abi != device.abi_major {
+            return Err(format!(
+                "built for Canopus ABI {}, this band speaks {}",
+                self.abi, device.abi_major
+            ));
+        }
+        if let Some(min) = self.min_framework {
+            if device.framework_revision < min {
+                return Err(format!(
+                    "needs Canopus framework revision {min}, the band has {}",
+                    device.framework_revision
+                ));
+            }
+        }
+        if !self.targets.is_empty() {
+            match device.target_id {
+                None => return Err("the band does not report its firmware target".into()),
+                Some(id) if !self.targets.iter().any(|t| t == id) => {
+                    return Err(format!("no build for firmware target {id}"));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -203,5 +261,39 @@ mod tests {
             ManifestBundledResourceTypeV2::Plugin
         );
         assert!(manifest.ext.get("anotherFutureExtension").is_some());
+    }
+    fn band(target: Option<&'static str>, framework: u32) -> CanopusDeviceCompat<'static> {
+        CanopusDeviceCompat { target_id: target, framework_revision: framework, abi_major: 1 }
+    }
+
+    #[test]
+    fn canopus_download_names_what_it_needs_from_the_band() {
+        let download: ManifestDownloadV2 = serde_json::from_value(serde_json::json!({
+            "version": "1.2.0",
+            "file_name": "demo-1.2.0.canopus",
+            "versionCode": 12,
+            "canopus": { "abi": 1, "targets": ["xiaomi-band-11-4.100.155"], "minFramework": 3 }
+        }))
+        .expect("download should deserialize");
+        let needs = download.canopus.expect("canopus metadata");
+        assert_eq!(needs.targets, vec!["xiaomi-band-11-4.100.155"]);
+        assert_eq!(needs.min_framework, Some(3));
+
+        assert!(needs.check(&band(Some("xiaomi-band-11-4.100.155"), 3)).is_ok());
+        assert!(needs.check(&band(Some("xiaomi-band-11-4.100.139"), 3)).unwrap_err().contains("4.100.139"));
+        assert!(needs.check(&band(None, 3)).unwrap_err().contains("does not report"));
+        assert!(needs.check(&band(Some("xiaomi-band-11-4.100.155"), 2)).unwrap_err().contains("framework"));
+        let other_abi = CanopusDeviceCompat { abi_major: 2, ..band(Some("xiaomi-band-11-4.100.155"), 3) };
+        assert!(needs.check(&other_abi).unwrap_err().contains("ABI"));
+    }
+
+    #[test]
+    fn portable_canopus_download_lists_no_targets() {
+        let needs: ManifestCanopusV2 =
+            serde_json::from_value(serde_json::json!({ "abi": 1 })).expect("abi only");
+        assert!(needs.targets.is_empty() && needs.min_framework.is_none());
+        assert!(needs.check(&band(None, 0)).is_ok());
+        let again = serde_json::to_value(&needs).unwrap();
+        assert_eq!(again, serde_json::json!({ "abi": 1 }));
     }
 }

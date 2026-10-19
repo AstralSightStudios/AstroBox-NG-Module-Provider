@@ -121,6 +121,7 @@ mod tests {
             sha256: None,
             display_name: None,
             updatelogs: None,
+            canopus: None,
         }
     }
 
